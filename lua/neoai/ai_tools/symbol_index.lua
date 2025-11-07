@@ -381,8 +381,8 @@ local function leading_comment_block(bufnr, start_line_1, lang)
       i = i - 1
     else
       if
-        (lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go")
-        and ends_with_block_end(l)
+          (lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go")
+          and ends_with_block_end(l)
       then
         in_block = true
         block_collected = { l }
@@ -474,12 +474,12 @@ local function fallback_scan(bufnr, lang, max_symbols)
   elseif lang == "python" then
     patterns = {
       { kind = "function", pat = "^%s*def%s+([A-Za-z_][%w_]*)%s*%((.-)%)" },
-      { kind = "class", pat = "^%s*class%s+([A-Za-z_][%w_]*)%s*%b()?:" },
+      { kind = "class",    pat = "^%s*class%s+([A-Za-z_][%w_]*)%s*%b()?:" },
     }
   elseif lang == "javascript" or lang == "typescript" or lang == "tsx" then
     patterns = {
       { kind = "function", pat = "^%s*function%s+([A-Za-z_$][%w_$]*)%s*%((.-)%)" },
-      { kind = "class", pat = "^%s*class%s+([A-Za-z_$][%w_$]*)%s*[%{%w]" },
+      { kind = "class",    pat = "^%s*class%s+([A-Za-z_$][%w_$]*)%s*[%{%w]" },
     }
   elseif lang == "go" then
     patterns = {
@@ -645,7 +645,12 @@ local function extract_symbols_for_file(file_path, args)
             if not n or depth > 3 then
               return nil
             end
-            if wanted[n:type()] then
+            local nt
+            if n and (type(n) == "userdata" or type(n) == "table") and n.type then
+              local ok_t, t = pcall(n.type, n)
+              if ok_t then nt = t end
+            end
+            if nt and wanted[nt] then
               return n
             end
             local count = n:named_child_count() or 0
@@ -734,10 +739,20 @@ local function extract_symbols_for_file(file_path, args)
           }
           local steps = 0
           while n and steps < 6 do
-            if want[n:type()] then
+            local nt
+            if n and (type(n) == "userdata" or type(n) == "table") and n.type then
+              local ok_t, t = pcall(n.type, n)
+              if ok_t then nt = t end
+            end
+            if nt and want[nt] then
               return n
             end
-            n = n:parent()
+            local p
+            if n and (type(n) == "userdata" or type(n) == "table") and n.parent then
+              local ok_p, pn = pcall(n.parent, n)
+              if ok_p then p = pn end
+            end
+            n = p
             steps = steps + 1
           end
           return nil
