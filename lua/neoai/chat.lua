@@ -38,6 +38,16 @@ local function get_main_model_name()
   return model
 end
 
+local function input_has_text()
+  local ib = chat.chat_state and chat.chat_state.buffers and chat.chat_state.buffers.input or nil
+  if not (ib and vim.api.nvim_buf_is_valid(ib)) then
+    return false
+  end
+  local lines = vim.api.nvim_buf_get_lines(ib, 0, -1, false)
+  local text = table.concat(lines, "\n"):gsub("^%s+", ""):gsub("%s+$", "")
+  return text ~= ""
+end
+
 -- Helper: build the Assistant header including the model name when available
 local function build_assistant_header(time_str)
   local model = get_main_model_name()
@@ -434,6 +444,7 @@ local function maybe_open_deferred_reviews()
   -- Queue all paths and open the first one
   chat.chat_state.awaiting_user_review = true
   chat.chat_state._review_queue = vim.deepcopy(paths)
+  chat.chat_state._auto_resume_after_review = true -- arm one-shot auto-resume
 
   local function open_next()
     if not chat.chat_state._review_queue or #chat.chat_state._review_queue == 0 then
@@ -540,6 +551,18 @@ function chat.setup()
           end)
         else
           chat.chat_state.awaiting_user_review = false
+          -- Always auto-resume once after the final review, unless the user is typing or a stream already started.
+          if chat.chat_state._auto_resume_after_review then
+            chat.chat_state._auto_resume_after_review = false -- one-shot
+            vim.schedule(function()
+              if not chat.chat_state.streaming_active and not input_has_text() then
+                log("diff_closed: auto-resume after final review")
+                chat.send_to_ai()
+              else
+                log("diff_closed: skip auto-resume (streaming or user input present)")
+              end
+            end)
+          end
         end
       end,
     })
