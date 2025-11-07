@@ -999,11 +999,13 @@ function chat.stream_ai_response(messages)
       chat.update_streaming_message(reason, tostring(content), false)
     elseif chunk.type == "tool_calls" then
       if chunk.data and type(chunk.data) == "table" then
+        local stamp = tostring(os.time())
         for _, tool_call in ipairs(chunk.data) do
-          if tool_call and tool_call.index then
+          if tool_call and tool_call.index ~= nil then
             local found = false
             for _, existing_call in ipairs(tool_calls_response) do
               if existing_call.index == tool_call.index then
+                -- Merge name/arguments
                 if tool_call["function"] then
                   existing_call["function"] = existing_call["function"] or {}
                   if tool_call["function"].name and tool_call["function"].name ~= "" then
@@ -1014,14 +1016,26 @@ function chat.stream_ai_response(messages)
                       .. tool_call["function"].arguments
                   end
                 end
+                -- Ensure a stable id even if provider omitted it
+                if not existing_call.id or existing_call.id == "" then
+                  local tcid = tool_call.id
+                  if not tcid or tcid == "" then
+                    tcid = string.format("tc-%s-%d", stamp, tool_call.index or 0)
+                  end
+                  existing_call.id = tcid
+                end
                 found = true
                 break
               end
             end
             if not found then
+              local tcid = tool_call.id
+              if not tcid or tcid == "" then
+                tcid = string.format("tc-%s-%d", stamp, tool_call.index or 0)
+              end
               local complete_tool_call = {
                 index = tool_call.index,
-                id = tool_call.id,
+                id = tcid,
                 type = tool_call.type or "function",
                 ["function"] = {
                   name = tool_call["function"] and tool_call["function"].name or "",

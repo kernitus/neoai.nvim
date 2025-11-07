@@ -19,7 +19,18 @@ local function apply_delay(callback)
   end
 end
 
---- Execute tool calls emitted by the model, persist messages, and handle gating/iteration.
+-- Ensure each streamed tool schema has a stable id so we can pair responses.
+local function ensure_tool_ids(tool_schemas)
+  local stamp = tostring(os.time())
+  for i, sc in ipairs(tool_schemas or {}) do
+    if sc and (sc.id == nil or sc.id == "") then
+      local idx = sc.index or i
+      sc.id = string.format("tc-%s-%d", stamp, idx)
+    end
+  end
+end
+
+--- Execute tool calls emitted by the model, persist messages, and then resume the model.
 --- @param chat_module table
 --- @param tool_schemas table
 function M.run_tool_calls(chat_module, tool_schemas)
@@ -33,40 +44,28 @@ function M.run_tool_calls(chat_module, tool_schemas)
     return
   end
 
-  local before_await_id = c._diff_await_id or 0
+  -- S synthesise ids if the provider omitted them
+  ensure_tool_ids(tool_schemas)
+
+  -- Persist a minimal assistant message that carries tool_calls (ids included)
   local call_names = {}
   for _, sc in ipairs(tool_schemas) do
     if sc and sc["function"] and sc["function"].name and sc["function"].name ~= "" then
       table.insert(call_names, sc["function"].name)
     end
   end
-  local call_title = "**Tool call**"
-  if #call_names > 0 then
-    call_title = "**Tool call:** " .. table.concat(call_names, ", ")
-  end
+  local call_title = (#call_names > 0) and ("**Tool call:** " .. table.concat(call_names, ", ")) or "**Tool call**"
   chat_module.add_message(MT.ASSISTANT, call_title, {}, nil, tool_schemas)
-  pcall(vim.notify, "NeoAI tool_runner: executing tool calls: " .. table.concat(call_names, ", "), vim.log.levels.DEBUG)
+
   local completed = 0
 
-  -- Track whether we should pause for user review after processing tool calls
-  local should_gate = false
-  local deferred_to_open ---@type string|nil
-
-  -- Helper to extract orchestration markers from tool output
-  local function parse_markers(text)
-    if type(text) ~= "string" or text == "" then
-      return nil, nil
-    end
-    local hash = text:match("NeoAI%-Diff%-Hash:%s*([%w_%-]+)")
-    local diag = text:match("NeoAI%-Diagnostics%-Count:%s*(%d+)")
-    return hash, (diag and tonumber(diag) or nil)
-  end
-
+  -- Execute each call and persist a Tool message with tool_call_id matching the assistant.tool_calls id
   for _, schema in ipairs(tool_schemas) do
     if schema.type == "function" and schema["function"] and schema["function"].name then
       local fn = schema["function"]
-      local ok, args = pcall(vim.fn.json_decode, fn.arguments or "")
-      if not ok then
+
+      local ok_args, args = pcall(vim.fn.json_decode, fn.arguments or "")
+      if not ok_args then
         args = {}
       end
 
@@ -74,22 +73,10 @@ function M.run_tool_calls(chat_module, tool_schemas)
       for _, tool in ipairs(ai_tools.tools) do
         if tool.meta.name == fn.name then
           tool_found = true
-          -- Force Edit calls to run headlessly and defer user review
-          if fn.name == "Edit" then
-            -- Print the raw JSON arguments for the Edit tool call to :messages
-            --vim.print("[NeoAI] Edit tool call JSON:", fn.arguments)
-
-            args = args or {}
-            local file_key0 = (args and args.file_path) or "<unknown>"
-            if not deferred_to_open then
-              deferred_to_open = file_key0
-            end
-          end
 
           local resp_ok, resp = pcall(tool.run, args)
-
           local meta = { tool_name = fn.name }
-          local content = ""
+          local content
           if not resp_ok then
             content = "Error executing tool " .. fn.name .. ": " .. tostring(resp)
             vim.notify(content, vim.log.levels.ERROR)
@@ -99,13 +86,9 @@ function M.run_tool_calls(chat_module, tool_schemas)
               if resp.display and resp.display ~= "" then
                 meta.display = resp.display
               end
-              -- If the tool provides a params_line, prepend it to the content so it shows in chat
               if resp.params_line and resp.params_line ~= "" then
-                if content ~= "" then
-                  content = tostring(resp.params_line) .. "\n\n" .. content
-                else
-                  content = tostring(resp.params_line)
-                end
+                content = (content ~= "" and (tostring(resp.params_line) .. "\n\n" .. content))
+                  or tostring(resp.params_line)
               end
             else
               content = type(resp) == "string" and resp or tostring(resp) or ""
@@ -114,112 +97,25 @@ function M.run_tool_calls(chat_module, tool_schemas)
           if content == "" then
             content = "No response"
           end
+
+          -- The critical bit: attach the matching id so the shaper will include this tool message
           chat_module.add_message(MT.TOOL, tostring(content), meta, schema.id)
 
-          -- Forced iteration control: evaluate stop conditions after Edit tool
-          if fn.name == "Edit" then
-            local file_key = (args and args.file_path) or "<unknown>"
-            c._iter_map = c._iter_map or {}
-            local st = c._iter_map[file_key] or { count = 0, last_hash = nil }
-            st.count = (st.count or 0) + 1
-
-            local diff_hash, diag_count = parse_markers(content)
-            local unchanged = (st.last_hash ~= nil and diff_hash ~= nil and st.last_hash == diff_hash)
-
-            local stop = false
-            if diag_count ~= nil and diag_count <= 0 then
-              stop = true
-            end
-            if unchanged then
-              stop = true
-            end
-            if st.count >= 3 then
-              stop = true
-            end
-
-            st.last_hash = diff_hash or st.last_hash
-            c._iter_map[file_key] = st
-
-            if stop then
-              should_gate = true
-              if not deferred_to_open then
-                deferred_to_open = file_key
-              end
-            end
-          end
-
+          completed = completed + 1
           break
         end
       end
+
       if not tool_found then
         local err = "Tool not found: " .. fn.name
         vim.notify(err, vim.log.levels.ERROR)
         chat_module.add_message(MT.TOOL, err, {}, schema.id)
+        completed = completed + 1
       end
-      completed = completed + 1
     end
   end
 
-  -- Open the deferred review only when stop conditions are met (diagnostics clean/unchanged/max tries).
-  -- Merely staging edits is not sufficient to gate; we keep iterating to improve before surfacing to the user.
-  if should_gate and deferred_to_open and deferred_to_open ~= "" then
-    local opened = false
-    local ok_open, edit_mod = pcall(require, "neoai.ai_tools.edit")
-    if ok_open and edit_mod and type(edit_mod.open_deferred_review) == "function" then
-      local ok2 = false
-      local _, _msg = pcall(function()
-        local ok3, _ = edit_mod.open_deferred_review(deferred_to_open)
-        ok2 = ok3 and true or false
-      end)
-      opened = ok2
-    end
-
-    if opened then
-      c._diff_await_id = (c._diff_await_id or 0) + 1
-      local await_id = c._diff_await_id or 0
-
-      chat_module.add_message(
-        MT.SYSTEM,
-        "Awaiting your review in the inline diff. The assistant will resume once you finish reviewing.",
-        {}
-      )
-      c.streaming_active = false
-
-      c._pending_diff_reviews = (c._pending_diff_reviews or 0) + 1
-      local grp_id = vim.api.nvim_create_augroup("NeoAIDiffAwait_" .. tostring(await_id), { clear = true })
-      vim.api.nvim_create_autocmd("User", {
-        group = grp_id,
-        pattern = "NeoAIInlineDiffClosed",
-        callback = function()
-          -- Reset iteration state for the next cycle after the user closes the diff
-          c._iter_map = {}
-          c._pending_diff_reviews = math.max(0, (c._pending_diff_reviews or 0) - 1)
-          if c._pending_diff_reviews == 0 then
-            pcall(vim.api.nvim_del_augroup_by_id, grp_id)
-            apply_delay(function()
-              chat_module.send_to_ai()
-            end)
-          end
-        end,
-        once = false,
-      })
-      return
-    end
-  end
-
-  -- If we reach here, either we did not gate, or we failed to open a review (e.g., headless). Continue the loop.
-  -- If we decided to pause for review, bump the await counter once (no-op for continuation path).
-  if should_gate then
-    c._iter_map = {}
-  end
-
-  local after_await_id = c._diff_await_id or 0
-  local new_diffs = math.max(0, after_await_id - before_await_id)
-  if new_diffs > 0 then
-    -- Already handled above when opened; this is a safety no-op path.
-    return
-  end
-
+  -- Resume the model with the tool outputs now persisted
   if completed > 0 then
     apply_delay(function()
       chat_module.send_to_ai()
