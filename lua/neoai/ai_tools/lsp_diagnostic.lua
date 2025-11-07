@@ -108,7 +108,7 @@ local severity_map = {
 M.run = function(args)
   args = args or {}
   -- Determine buffer number (allow internal callers to pass bufnr explicitly)
-  local bufnr ---@type number
+  local bufnr ---@type integer|nil
   if type(args.bufnr) == "number" and args.bufnr > 0 then
     bufnr = args.bufnr
     if not args.file_path or args.file_path == "" then

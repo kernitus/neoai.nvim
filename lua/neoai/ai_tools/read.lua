@@ -39,51 +39,82 @@ M.meta = {
 --- @param args Reader: Arguments for the reading process
 --- @return table<string, string>: The content and status display information
 M.run = function(args)
-  local pwd = vim.fn.getcwd()
-  local path = pwd .. "/" .. args.file_path
-  local start_line = args.start_line or 1
-  local end_line = args.end_line or math.huge
+  local pwd = vim.loop.cwd() or vim.fn.getcwd()
+  local abs_path = args.file_path
+  if not abs_path:match("^/") and not abs_path:match("^%a:[/\\]") then
+    abs_path = pwd .. "/" .. abs_path
+  end
+  abs_path = vim.fn.fnamemodify(abs_path, ":p")
 
-  local file = io.open(path, "r")
-  if not file then
-    return { content = "Cannot open file: " .. path, display = "Read: " .. args.file_path .. " (failed)" }
+  local start_line = tonumber(args.start_line) or 1
+  if start_line < 1 then
+    start_line = 1
+  end
+
+  local function read_current_or_disk(path)
+    local target = vim.fn.fnamemodify(path, ":p")
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_loaded(b) then
+        local name = vim.api.nvim_buf_get_name(b)
+        if name ~= "" and vim.fn.fnamemodify(name, ":p") == target then
+          local lines = vim.api.nvim_buf_get_lines(b, 0, -1, false)
+          return table.concat(lines, "\n"), b
+        end
+      end
+    end
+    local ok, lines = pcall(vim.fn.readfile, target)
+    if ok and type(lines) == "table" then
+      return table.concat(lines, "\n"), nil
+    end
+    local f = io.open(target, "rb")
+    if f then
+      local content = f:read("*a") or ""
+      f:close()
+      return content, nil
+    end
+    return nil, nil
+  end
+
+  local content, bufnr = read_current_or_disk(abs_path)
+  if not content then
+    return { content = "Cannot open file: " .. abs_path, display = "Read: " .. args.file_path .. " (failed)" }
+  end
+
+  local raw_lines = vim.split(content, "\n", { plain = true })
+  local total_lines = #raw_lines
+  local end_line = args.end_line and tonumber(args.end_line) or total_lines
+  if end_line == math.huge or not end_line or end_line > total_lines then
+    end_line = total_lines
+  elseif end_line < start_line then
+    end_line = start_line
   end
 
   local lines = {}
-  local current_line = 1
-  for line in file:lines() do
-    if current_line >= start_line and current_line <= end_line then
-      local width = #tostring(end_line) -- max digits of the highest line number
-      table.insert(lines, string.format("%" .. width .. "d|%s", current_line, line))
-    end
-    if current_line > end_line then
-      break
-    end
-    current_line = current_line + 1
+  local width = #tostring(end_line)
+  for ln = start_line, end_line do
+    local line = raw_lines[ln] or ""
+    table.insert(lines, string.format("%" .. width .. "d|%s", ln, line))
   end
-  file:close()
-  --- Extracts the file extension from the given filename.
-  --- @param filename string: The name of the file
-  --- @return string: The file extension
+
   local function get_extension(filename)
     return filename:match("^.+%.([a-zA-Z0-9_]+)$") or ""
   end
 
-  local ext = get_extension(path)
+  local ext = get_extension(abs_path)
   local text = table.concat(lines, "\n")
   local result = utils.make_code_block(text, ext)
 
-  -- Append LSP diagnostics
-  local diag = require("neoai.ai_tools.lsp_diagnostic").run({ file_path = args.file_path })
-  local content = result .. "\n" .. diag
+  local diag_args = bufnr and { bufnr = bufnr, file_path = args.file_path } or { file_path = args.file_path }
+  local diag = require("neoai.ai_tools.lsp_diagnostic").run(diag_args)
+  local content_out = result .. "\n" .. diag
   local display = string.format(
     "Read: %s (%s:%s-%s)",
     args.file_path,
     ext ~= "" and ext or "txt",
     tostring(start_line),
-    tostring(end_line == math.huge and "EOF" or end_line)
+    tostring(end_line)
   )
-  return { content = content, display = display }
+  return { content = content_out, display = display }
 end
 
 return M

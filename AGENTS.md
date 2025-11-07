@@ -36,6 +36,8 @@ The system prompt automatically includes a list of available tools and, if prese
 - This ensures we never “continue with changes staged”.
 
 Tool output notes:
+- Read tool is swap-safe: it never opens a file as a buffer for inspection. It reads from an already-loaded buffer (to include unsaved edits) when available, otherwise from disk via vim.fn.readfile/io.open. This avoids E325 swap prompts.
+
 - Grep tool now echoes the parameters used. The runner prepends a single line like:
   "Parameters used: query_string="pattern"; use_regex=false; glob=nil"
   above the result block when available.

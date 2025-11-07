@@ -14,9 +14,9 @@
 
 - Displays file contents with line numbers for easy reference.
 - Reads from any specified line range in a file.
-- Handles large files by limiting the number of lines read.
 - Detects file extension for appropriate display formatting.
-- Includes LSP diagnostics append to the output.
+- Includes LSP diagnostics appended to the output.
+- Swap-safe: never opens files as buffers just to read. If the file is already loaded in this Neovim, it reads from that buffer (including unsaved edits). Otherwise, it reads from disk directly (no swap prompt).
 
 # LIMITATIONS
 
