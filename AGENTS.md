@@ -16,6 +16,7 @@ Conversation shaping for tools:
 - When sending messages to the API, the chat module now shapes history to respect provider constraints: messages with role 'tool' are only included if they immediately follow an assistant message that includes matching tool_calls, and their tool_call_id must match one of those calls.
 - Orphan tool messages (e.g., when truncating long history) are omitted from the payload to prevent HTTP 400 errors like "messages with role 'tool' must be a response to a preceeding message with 'tool_calls'."
 - A larger recent-window is fetched to minimise slicing across an assistant/tool boundary.
+- On the first user turn of a new session, NeoAI always runs a bootstrap preflight that issues synthetic tool_calls for project context (ProjectStructure and SymbolIndex by default) and immediately executes them locally before resuming the model. This behaviour is unconditional; you may customise the tool list via chat.bootstrap.tools but cannot disable the preflight.
 
 Key components:
 - lua/neoai/chat.lua — Chat UI, message orchestration, tool invocation, response streaming

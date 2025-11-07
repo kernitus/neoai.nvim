@@ -30,7 +30,6 @@
 ---@field args table|nil
 
 ---@class BootstrapConfig
----@field enabled boolean
 ---@field strategy string|nil
 ---@field tools BootstrapToolConfig[]
 
@@ -110,10 +109,10 @@ config.defaults = {
     -- Streaming/response handling
     thinking_timeout = 300, -- seconds
 
-    -- Bootstrap pre-flight: run selected tools on the first user turn and inject
+    -- Bootstrap pre-flight: always runs on the first user turn and injects
     -- synthetic tool_call + tool messages so the model starts with context.
+    -- You may override the tool list via chat.bootstrap.tools, but it cannot be disabled.
     bootstrap = {
-      enabled = true,
       strategy = "synthetic_tool_call", -- reserved for future strategies
       tools = {
         {

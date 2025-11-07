@@ -865,12 +865,12 @@ function chat.send_to_ai()
   -- an assistant tool_calls turn and its tool responses.
   local session_msgs = storage.get_session_messages(chat.chat_state.current_session.id, 300)
 
-  -- Bootstrap pre-flight: force selected tool calls before the first real AI turn.
+  -- Bootstrap pre-flight: always run on the first user turn of a new session.
   do
-    local boot = (chat.chat_state and chat.chat_state.config and chat.chat_state.config.bootstrap) or nil
     local is_first_turn = (#session_msgs == 2 and session_msgs[2].type == MESSAGE_TYPES.USER)
-    if boot and boot.enabled and is_first_turn then
-      require("neoai.bootstrap").run_preflight(chat, boot)
+    if is_first_turn then
+      local boot_cfg = (chat.chat_state and chat.chat_state.config and chat.chat_state.config.bootstrap) or nil
+      require("neoai.bootstrap").run_preflight(chat, boot_cfg)
       -- Refresh session messages so the subsequent payload includes the bootstrap turn
       session_msgs = storage.get_session_messages(chat.chat_state.current_session.id, 300)
     end

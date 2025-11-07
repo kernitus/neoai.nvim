@@ -82,7 +82,38 @@ end
 -- Public: run bootstrap preflight on first turn
 function M.run_preflight(chat_module, boot_cfg)
   local ai_tools = require("neoai.ai_tools")
-  local specs = (boot_cfg and type(boot_cfg.tools) == "table") and boot_cfg.tools or {}
+  local specs = nil
+  if boot_cfg and type(boot_cfg.tools) == "table" and #boot_cfg.tools > 0 then
+    specs = boot_cfg.tools
+  else
+    -- Provide sensible defaults if no configuration supplied
+    specs = {
+      {
+        name = "ProjectStructure",
+        args = {
+          path = ".",
+          preferred_depth = 3,
+          adaptive = true,
+          small_file_threshold = 50,
+          large_file_threshold = 400,
+        },
+      },
+      {
+        name = "SymbolIndex",
+        args = {
+          path = ".",
+          globs = { "**/*" },
+          include_docstrings = true,
+          include_ranges = true,
+          include_signatures = true,
+          max_files = 150,
+          max_symbols_per_file = 300,
+          fallback_to_text = true,
+        },
+      },
+    }
+  end
+
   local tool_calls, names, spec_args_map = build_tool_calls(specs, ai_tools)
   if #tool_calls == 0 then
     return
