@@ -124,7 +124,34 @@ local function node_text(node, bufnr)
   if ok2 then
     return text
   end
-  local sr, sc, er, ec = node:range()
+  -- Only attempt range() if present and callable
+  local sr, sc, er, ec
+  local okr = false
+  if (type(node) == "userdata" or type(node) == "table") then
+    local r = nil
+    -- Prefer direct field; fall back to metatable __index if needed
+    if type(node.range) == "function" then
+      r = node.range
+    else
+      local mt = getmetatable(node)
+      local idx = mt and mt.__index
+      if type(idx) == "table" and type(idx.range) == "function" then
+        r = idx.range
+      elseif type(idx) == "function" then
+        -- Some TS nodes expose methods via functional __index; try raw lookup
+        local ok_raw, got = pcall(idx, node, "range")
+        if ok_raw and type(got) == "function" then
+          r = got
+        end
+      end
+    end
+    if type(r) == "function" then
+      okr, sr, sc, er, ec = pcall(r, node)
+    end
+  end
+  if not okr or sr == nil then
+    return nil
+  end
   local lines = vim.api.nvim_buf_get_text(bufnr, sr, sc, er, ec, {})
   return table.concat(lines, "\n")
 end
@@ -133,7 +160,32 @@ local function make_range(node)
   if not node then
     return nil
   end
-  local sr, sc, er, ec = node:range()
+  -- Only attempt range() if present and callable
+  local sr, sc, er, ec
+  local okr = false
+  if (type(node) == "userdata" or type(node) == "table") then
+    local r = nil
+    if type(node.range) == "function" then
+      r = node.range
+    else
+      local mt = getmetatable(node)
+      local idx = mt and mt.__index
+      if type(idx) == "table" and type(idx.range) == "function" then
+        r = idx.range
+      elseif type(idx) == "function" then
+        local ok_raw, got = pcall(idx, node, "range")
+        if ok_raw and type(got) == "function" then
+          r = got
+        end
+      end
+    end
+    if type(r) == "function" then
+      okr, sr, sc, er, ec = pcall(r, node)
+    end
+  end
+  if not okr or sr == nil then
+    return nil
+  end
   return { start_line = sr + 1, start_col = sc + 1, end_line = er + 1, end_col = ec + 1 }
 end
 
@@ -573,7 +625,6 @@ local function extract_symbols_for_file(file_path, args)
     table.insert(symbols, item)
   end
 
-  local tsq = nil
   local used_any = false
   if parser then
     -- 1) Prefer runtime symbol_index query if present
