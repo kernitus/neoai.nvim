@@ -1,6 +1,8 @@
 local Job = require("plenary.job")
 local conf = require("neoai.config").get_api("main")
 local tool_schemas = require("neoai.ai_tools").tool_schemas
+local log = require("neoai.debug").log
+
 local api = {}
 
 -- Track current streaming job
@@ -29,12 +31,18 @@ end
 --- @param on_error fun(err: integer|string)
 --- @param on_cancel fun()|nil
 function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
+  log(
+    "api.stream: start | messages=%d tools=%d model=%s",
+    #(messages or {}),
+    #(tool_schemas or {}),
+    tostring(conf.model)
+  )
   -- Track if we've already reported an error to avoid duplicate notifications
   local error_reported = false
   -- Buffer non-SSE stdout to recover JSON error bodies when the server doesn't stream
   local non_sse_buf = {}
   local http_status -- captured from curl --write-out
-  -- Create a new job and mark it as not cancelled
+  local saw_any_chunk = false
 
   local basic_payload = {
     model = conf.model,
@@ -46,12 +54,10 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
 
   local payload = vim.fn.json_encode(merge_tables(basic_payload, conf.additional_kwargs or {}))
 
-  -- Optional debug: show the exact JSON payload being sent to curl
   if conf.debug_payload then
     vim.notify("NeoAI: Sending JSON payload to curl (stream):\n" .. payload, vim.log.levels.DEBUG, { title = "NeoAI" })
   end
 
-  -- Accumulate raw body for verbose error reporting in non-SSE cases
   local raw_body_chunks = {}
 
   local api_key_header = conf.api_key_header or "Authorization"
@@ -59,11 +65,12 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
   local api_key_value = string.format(api_key_format, conf.api_key)
   local api_key = api_key_header .. ": " .. api_key_value
 
+  log("api.stream: spawning curl | url=%s", tostring(conf.url))
   current_job = Job:new({
     command = "curl",
     args = {
       "--silent",
-      "--show-error", -- ensure errors are printed even in silent mode
+      "--show-error",
       "--no-buffer",
       "--location",
       conf.url,
@@ -73,19 +80,18 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
       api_key,
       "--data-binary",
       "@-",
-      -- Always emit the HTTP status code at the end so we can report it if no JSON error was parsed
       "--write-out",
       "\nHTTPSTATUS:%{http_code}\n",
     },
-    -- Send JSON payload via stdin to avoid hitting argv length limits
     writer = payload,
     on_stdout = function(_, line)
       for _, data_line in ipairs(vim.split(line, "\n")) do
         if vim.startswith(data_line, "data: ") then
           local chunk = data_line:sub(7)
+          saw_any_chunk = true
           vim.schedule(function()
-            -- Some providers send a terminal sentinel line
             if chunk == "[DONE]" then
+              log("api.stream: SSE [DONE] -> on_complete()")
               if not error_reported then
                 on_complete()
               end
@@ -97,7 +103,6 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
               return
             end
 
-            -- Detect SSE error payloads and surface immediately (include raw chunk for visibility)
             if not error_reported and type(decoded) == "table" then
               local err_msg
               if type(decoded.error) == "table" then
@@ -115,7 +120,7 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                   .. vim.inspect(decoded)
                   .. "\nFull SSE chunk (raw):\n"
                   .. chunk
-                -- Immediate user-visible error with full details
+                log("api.stream: on_error | %s", tostring(err_msg))
                 vim.notify(verbose, vim.log.levels.ERROR, { title = "NeoAI" })
                 on_error(verbose)
                 return
@@ -124,19 +129,16 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
 
             local handled = false
 
-            -- Handler for OpenAI Responses API-style events
             if decoded.type and type(decoded.type) == "string" then
+              log("api.stream: sse.type=%s", tostring(decoded.type))
               local t = decoded.type
-              -- Reasoning deltas
               if (t == "response.reasoning_text.delta" or t == "response.reasoning.delta") and decoded.delta then
                 on_chunk({ type = "reasoning", data = decoded.delta })
                 handled = true
               elseif t == "response.reasoning_text.done" or t == "response.reasoning.done" then
-                -- Reasoning segment finished; no-op for now
                 handled = true
               end
 
-              -- Content deltas (different providers may use slightly different names)
               if
                 t == "response.output_text.delta"
                 or t == "response.text.delta"
@@ -156,13 +158,13 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 end
                 handled = true
               elseif t == "response.completed" or t == "response.done" then
+                log("api.stream: response.completed -> on_complete()")
                 on_complete()
                 handled = true
               end
             end
 
             if not handled then
-              -- Fallback handler for OpenAI Chat Completions-compatible streams
               local choice = decoded.choices and decoded.choices[1]
               if choice then
                 local delta = choice.delta or {}
@@ -170,7 +172,6 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 local tool_calls = delta and delta.tool_calls
                 local reasons = delta and delta.reasoning
 
-                -- Emit both reasoning and content if present in the same delta
                 if reasons and reasons ~= vim.NIL and reasons ~= "" then
                   on_chunk({ type = "reasoning", data = reasons })
                 end
@@ -178,25 +179,28 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                   on_chunk({ type = "content", data = content })
                 end
                 if tool_calls then
+                  local ids = {}
+                  for _, tc in ipairs(tool_calls) do
+                    table.insert(ids, tostring(tc.id or ("<nil>#" .. tostring(tc.index))))
+                  end
+                  log("api.stream: emit tool_calls | n=%d ids=%s", #tool_calls, table.concat(ids, ","))
                   on_chunk({ type = "tool_calls", data = tool_calls })
                 end
 
                 local finished_reason = choice.finish_reason
                 if finished_reason == "stop" or finished_reason == "tool_calls" then
+                  log("api.stream: on_complete() via finish_reason=%s", tostring(finished_reason))
                   on_complete()
                 end
               end
             end
           end)
         else
-          -- Non-SSE output: capture HTTP status and buffer any JSON body to surface real error messages
           local trimmed = vim.trim(data_line)
-          -- Capture the emitted HTTP status code from curl
           local st = trimmed:match("^HTTPSTATUS:(%d+)$")
           if st then
             http_status = tonumber(st)
           else
-            -- Accumulate non-SSE lines; many providers return a single-line JSON error but we guard for multi-line too
             if trimmed ~= "" then
               table.insert(non_sse_buf, trimmed)
               table.insert(raw_body_chunks, trimmed)
@@ -214,7 +218,6 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                   elseif decoded.error ~= nil then
                     err_msg = tostring(decoded.error)
                   elseif type(decoded) == "table" and decoded.message and not decoded.choices then
-                    -- Some providers return { message = "...", type = "..." } on errors
                     err_msg = decoded.message
                   end
                   if err_msg and err_msg ~= "" then
@@ -228,6 +231,7 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                         .. vim.inspect(decoded)
                         .. "\nFull response body (raw):\n"
                         .. agg_trim
+                      log("api.stream: on_error | %s", tostring(err_msg))
                       vim.notify(verbose, vim.log.levels.ERROR, { title = "NeoAI" })
                       on_error(verbose)
                     end)
@@ -243,11 +247,11 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
       if not line or line == "" then
         return
       end
-      -- With --show-error, curl writes human-readable errors here. Surface immediately for network/transport errors.
       if not error_reported then
         error_reported = true
         vim.schedule(function()
           local verbose = "curl error: " .. tostring(line)
+          log("api.stream: on_error | %s", verbose)
           vim.notify(verbose, vim.log.levels.ERROR, { title = "NeoAI" })
           on_error(verbose)
         end)
@@ -255,7 +259,12 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     end,
     on_exit = function(j, exit_code)
       vim.schedule(function()
-        -- Only act if this exiting job is still the active one
+        log(
+          "api.stream: on_exit | exit_code=%s saw_any_chunk=%s http_status=%s",
+          tostring(exit_code),
+          tostring(saw_any_chunk),
+          tostring(http_status)
+        )
         if current_job == j then
           current_job = nil
           if j._neoai_cancelled then
@@ -263,19 +272,19 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
               on_cancel()
             end
           else
-            -- If curl failed at the transport level
             if exit_code ~= 0 then
               local verbose = "curl exited with code: " .. tostring(exit_code)
+              log("api.stream: on_error | %s", verbose)
               vim.notify(verbose, vim.log.levels.ERROR, { title = "NeoAI" })
               on_error(verbose)
             else
-              -- Transport OK but we may still have an HTTP error without a parsed body
               if not error_reported and http_status and http_status >= 400 then
                 local raw_body = table.concat(raw_body_chunks, "\n")
                 local verbose = "HTTP " .. tostring(http_status) .. " error"
                 if raw_body ~= "" then
                   verbose = verbose .. "\nRaw body (unparsed):\n" .. raw_body
                 end
+                log("api.stream: on_error | %s", verbose)
                 vim.notify(verbose, vim.log.levels.ERROR, { title = "NeoAI" })
                 on_error(verbose)
               end
@@ -286,42 +295,35 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     end,
   })
 
-  -- Mark job as not cancelled initially
   current_job._neoai_cancelled = false
   current_job:start()
 end
 
 --- Cancel current streaming request (if any)
---- Cancels the current streaming request if one exists.
 function api.cancel()
   local job = current_job
   if not job then
     return
   end
 
-  -- Mark this specific job as cancelled
   job._neoai_cancelled = true
 
-  -- For curl SSE, closing pipes (shutdown) is not sufficient; send a signal.
-  -- Try SIGTERM first; if it doesn't exit quickly, escalate to SIGKILL.
   if type(job.kill) == "function" then
     pcall(function()
-      job:kill(15) -- SIGTERM
+      job:kill(15)
     end)
   end
 
-  -- Close stdio to avoid dangling handles
   if type(job.shutdown) == "function" then
     pcall(function()
       job:shutdown()
     end)
   end
 
-  -- Safety net: if job is still alive shortly after, force kill
   vim.defer_fn(function()
     if current_job == job and type(job.kill) == "function" then
       pcall(function()
-        job:kill(9) -- SIGKILL
+        job:kill(9)
       end)
     end
   end, 150)
