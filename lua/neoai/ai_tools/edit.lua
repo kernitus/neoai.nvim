@@ -1,18 +1,17 @@
 local utils = require("neoai.ai_tools.utils")
--- The finder module now handles all search logic.
 local finder = require("neoai.ai_tools.utils.find")
 
 local M = {}
 
--- State to hold original content of the buffer being edited.
+-- State to hold original content of the buffer being edited (for discard support).
 local active_edit_state = {}
 
--- Accumulator for deferred, end-of-loop reviews. Keyed by absolute path.
+-- Accumulator for deferred, end-of-turn reviews. Keyed by absolute path.
 -- Each entry: { baseline = {lines...}, latest = {lines...} }
 local deferred_reviews = {}
 
 --[[
-  UTILITY FUNCTIONS (with improved indentation handling)
+  UTILITY FUNCTIONS
 
   NOTE: Callers must buffer the full tool-call arguments (no partial streaming)
   before invoking this tool. Partial calls will be ignored with a diagnostic.
@@ -31,12 +30,10 @@ local function strip_cr(lines)
   end
 end
 
--- Compute the leading whitespace string for a given line.
 local function leading_ws(s)
   return (s or ""):match("^%s*") or ""
 end
 
--- Compute minimal indent length (in characters) among non-empty lines.
 local function min_indent_len(lines)
   local min_len
   for _, l in ipairs(lines) do
@@ -50,7 +47,6 @@ local function min_indent_len(lines)
   return min_len or 0
 end
 
--- Find the line index (1-based) within a range that has the minimal indent.
 local function range_min_indent_line(lines, s, e)
   local min_len, min_idx
   for i = s, math.max(s, e) do
@@ -66,7 +62,6 @@ local function range_min_indent_line(lines, s, e)
   return min_len or 0, min_idx
 end
 
--- Remove up to `n` leading whitespace characters (spaces or tabs) from a line.
 local function remove_leading_ws_chars(line, n)
   if n <= 0 then
     return line
@@ -84,7 +79,6 @@ local function remove_leading_ws_chars(line, n)
   return line:sub(i)
 end
 
--- Dedent lines by their minimal common indentation while preserving relative indentation.
 local function dedent(lines)
   local n = min_indent_len(lines)
   if n <= 0 then
@@ -101,15 +95,6 @@ local function dedent(lines)
   return out
 end
 
-local function unified_diff(old_lines, new_lines)
-  local old_str = table.concat(old_lines or {}, "\n")
-  local new_str = table.concat(new_lines or {}, "\n")
-  ---@diagnostic disable-next-line: missing-fields
-  local diff = vim.diff(old_str, new_str, { result_type = "unified", algorithm = "histogram" })
-  return diff or "(no changes)"
-end
-
--- Helper: get unrecognised keys in a shallow table against an allowed set
 local function unrecognised_keys(tbl, allowed)
   local unk = {}
   if type(tbl) ~= "table" then
@@ -124,9 +109,65 @@ local function unrecognised_keys(tbl, allowed)
   return unk
 end
 
+-- Best-effort diagnostics on proposed content without opening the review UI.
+-- This tries to avoid flicker: if the target buffer is currently shown, we skip mutation.
+local function best_effort_diagnostics(abs_path, proposed_lines)
+  local lsp_diag = require("neoai.ai_tools.lsp_diagnostic")
+
+  -- Find an existing loaded buffer for this path
+  local bufnr = nil
+  local target = vim.fn.fnamemodify(abs_path, ":p")
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) then
+      local name = vim.api.nvim_buf_get_name(b)
+      if vim.fn.fnamemodify(name, ":p") == target then
+        bufnr = b
+        break
+      end
+    end
+  end
+
+  local function is_buf_visible(b)
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(w) == b then
+        return true
+      end
+    end
+    return false
+  end
+
+  local diagnostics_str, count = "", 0
+
+  if bufnr and not is_buf_visible(bufnr) then
+    -- Temporarily swap in proposed lines, query diagnostics, then restore
+    local before = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local was_modified = vim.api.nvim_get_option_value("modified", { buf = bufnr })
+    pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, proposed_lines)
+    -- Give the LSP a moment and await counts
+    pcall(lsp_diag.await_count, { bufnr = bufnr, timeout_ms = 1500 })
+    diagnostics_str = lsp_diag.run({ file_path = abs_path, include_code_actions = false }) or ""
+    count = #vim.diagnostic.get(bufnr)
+    -- Restore content and modified flag
+    pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, before)
+    pcall(vim.api.nvim_set_option_value, "modified", was_modified, { buf = bufnr })
+  else
+    -- Use the high-level runner; may reflect current buffer state if visible, so treat as advisory.
+    diagnostics_str = lsp_diag.run({ file_path = abs_path, include_code_actions = false }) or ""
+    -- If we have a buffer, try to count; otherwise 0
+    local b = bufnr
+    if b then
+      pcall(lsp_diag.await_count, { bufnr = b, timeout_ms = 1500 })
+      count = #vim.diagnostic.get(b)
+    else
+      count = 0
+    end
+  end
+
+  return diagnostics_str, count
+end
+
 -- This function is called from chat.lua to close an open diffview window.
 function M.discard_all_diffs()
-  -- ... (function is unchanged)
   local ok, diff_utils = pcall(require, "neoai.ai_tools.utils")
   if ok and diff_utils and diff_utils.inline_diff and diff_utils.inline_diff.close then
     diff_utils.inline_diff.close()
@@ -177,10 +218,6 @@ M.meta = {
   },
 }
 
---- Validate an edit operation (plain text fields).
----@param edit table: The edit operation.
----@param index integer: The index of the edit operation.
----@return string|nil: An error message if validation fails, otherwise nil.
 local function validate_edit(edit, index)
   if type(edit.old_string) ~= "string" then
     return string.format("Edit %d: 'old_string' must be a string", index)
@@ -191,15 +228,32 @@ local function validate_edit(edit, index)
   return nil
 end
 
---- Execute the edit operations on a file.
----@param args table: A table containing the file path and edits.
----@return string: A status message.
+-- Public helpers for the orchestrator
+function M.get_deferred_paths()
+  local paths = {}
+  for p, v in pairs(deferred_reviews) do
+    if v and v.baseline and v.latest then
+      table.insert(paths, p)
+    end
+  end
+  table.sort(paths)
+  return paths
+end
+
+function M.has_deferred_reviews()
+  for _, v in pairs(deferred_reviews) do
+    if v and v.baseline and v.latest then
+      return true
+    end
+  end
+  return false
+end
+
 M.run = function(args)
   if type(args) ~= "table" then
     return string.format("Edit tool: ignored call; arguments must be an object/table (got %s)", type(args))
   end
 
-  -- Warn about any unrecognised top-level keys
   do
     local allowed_top = { file_path = true, edits = true }
     local unk = unrecognised_keys(args, allowed_top)
@@ -215,7 +269,6 @@ M.run = function(args)
   local rel_path = args.file_path
   local edits = args.edits
 
-  -- Gracefully ignore partial calls without spamming errors.
   if type(rel_path) ~= "string" or type(edits) ~= "table" then
     local keys = {}
     for k, _ in pairs(args) do
@@ -238,7 +291,6 @@ M.run = function(args)
     )
   end
 
-  -- Validate edits and warn about unrecognised keys per edit
   local allowed_edit_keys = { old_string = true, new_string = true }
   for i, edit in ipairs(edits) do
     local err = validate_edit(edit, i)
@@ -261,7 +313,6 @@ M.run = function(args)
   local abs_path = cwd .. "/" .. rel_path
 
   local content
-  local bufnr_from_list
   do
     local target = vim.fn.fnamemodify(abs_path, ":p")
     for _, b in ipairs(vim.api.nvim_list_bufs()) do
@@ -270,7 +321,6 @@ M.run = function(args)
         if vim.fn.fnamemodify(name, ":p") == target then
           local lines = vim.api.nvim_buf_get_lines(b, 0, -1, false)
           content = table.concat(lines, "\n")
-          bufnr_from_list = b
           break
         end
       end
@@ -289,18 +339,16 @@ M.run = function(args)
   local orig_lines = split_lines(normalise_eol(content))
   strip_cr(orig_lines)
 
-  -- Order-invariant, multi-pass application logic
+  -- Apply order-invariant, multi-pass logic on a working copy (memory only)
   local working_lines = vim.deepcopy(orig_lines)
   local total_replacements = 0
   local skipped_already_applied = 0
 
-  -- Preprocess edits into a pending list with decoded, split, normalised lines (plain text)
   local pending = {}
   for i, edit in ipairs(edits) do
     local raw_old = normalise_eol(edit.old_string or "")
     local is_insert = (raw_old == "")
     local old_lines = is_insert and {} or split_lines(raw_old)
-    -- Robustness in case old_lines becomes {""}
     if (not is_insert) and #old_lines == 1 and old_lines[1] == "" then
       is_insert = true
       old_lines = {}
@@ -316,8 +364,7 @@ M.run = function(args)
     })
   end
 
-  local function apply_replacement_at(working, s, e, new_lines)
-    -- Determine base indent from minimal-indented non-empty line within [s,e]
+  local function apply_replacement_at(working, s, e, new_lines_)
     local base_indent = ""
     if s and e and s >= 1 and e >= s then
       local _, idx = range_min_indent_line(working, s, e)
@@ -331,7 +378,7 @@ M.run = function(args)
     end
 
     local adjusted_new = {}
-    local dedented = dedent(new_lines)
+    local dedented = dedent(new_lines_)
     for k, line in ipairs(dedented) do
       if line:match("%S") then
         adjusted_new[k] = base_indent .. line
@@ -358,7 +405,6 @@ M.run = function(args)
     pass = pass + 1
     local next_pending = {}
 
-    -- Collect candidate matches for replacements
     local candidates = {}
     for _, item in ipairs(pending) do
       if item.kind == "replace" then
@@ -366,7 +412,6 @@ M.run = function(args)
         if s then
           table.insert(candidates, { item = item, s = s, e = e })
         else
-          -- Idempotency: treat as already applied if new block exists
           local ns, _ = finder.find_block_location(working_lines, item.new_lines, 1, nil)
           if ns then
             skipped_already_applied = skipped_already_applied + 1
@@ -375,12 +420,10 @@ M.run = function(args)
           end
         end
       else
-        -- Insert handled after replacements
         table.insert(next_pending, item)
       end
     end
 
-    -- Resolve overlapping matches: sort by start, pick non-overlapping
     table.sort(candidates, function(a, b)
       if a.s == b.s then
         return (a.e - a.s) < (b.e - b.s)
@@ -395,12 +438,10 @@ M.run = function(args)
         table.insert(selected, c)
         last_end = c.e
       else
-        -- Defer overlapping candidates
         table.insert(next_pending, c.item)
       end
     end
 
-    -- Apply selected replacements left-to-right; re-locate just before applying
     for _, c in ipairs(selected) do
       local s_now, e_now = finder.find_block_location(working_lines, c.item.old_lines, 1, nil)
       if s_now then
@@ -411,7 +452,6 @@ M.run = function(args)
       end
     end
 
-    -- Handle insertions (empty decoded old block): insert at top in pass 1, else append at end
     local inserts = {}
     for _, item in ipairs(next_pending) do
       if item.kind == "insert" then
@@ -419,7 +459,6 @@ M.run = function(args)
       end
     end
     if #inserts > 0 then
-      -- Remove inserts from next_pending
       local filtered = {}
       local to_insert_map = {}
       for _, it in ipairs(inserts) do
@@ -433,12 +472,10 @@ M.run = function(args)
       next_pending = filtered
 
       for _, ins in ipairs(inserts) do
-        -- For lack of a precise anchor, choose beginning on first pass, end otherwise
         local pos = (pass == 1) and 1 or (#working_lines + 1)
-        -- No indentation context for pure insertion; use dedented content as-is
-        local dedented = dedent(ins.new_lines)
-        for j = #dedented, 1, -1 do
-          table.insert(working_lines, pos, dedented[j])
+        local ded = dedent(ins.new_lines)
+        for j = #ded, 1, -1 do
+          table.insert(working_lines, pos, ded[j])
         end
         total_replacements = total_replacements + 1
       end
@@ -448,7 +485,6 @@ M.run = function(args)
   end
 
   if #pending > 0 then
-    -- Build a helpful error including a preview of the first pending block
     local first = pending[1]
     local preview_old = utils.make_code_block(table.concat(first.old_lines or {}, "\n"), "") or ""
     local preview_new = utils.make_code_block(table.concat(first.new_lines or {}, "\n"), "") or ""
@@ -461,7 +497,6 @@ M.run = function(args)
       preview_new,
     }, "\n\n")
     vim.notify("NeoAI Edit warning:\n" .. verbose, vim.log.levels.WARN, { title = "NeoAI" })
-    -- Continue with applied changes; do not hard-fail the whole run
   end
 
   if total_replacements == 0 then
@@ -473,7 +508,7 @@ M.run = function(args)
 
   local updated_lines = working_lines
 
-  -- Update the deferred review accumulator for this file (baseline preserved from first edit)
+  -- Accumulate into deferred review (baseline preserved from first edit)
   do
     local entry = deferred_reviews[abs_path]
     if entry == nil then
@@ -484,78 +519,30 @@ M.run = function(args)
     end
   end
 
-  -- With a UI available, always open the inline diff and return diagnostics to drive the AI loop.
-  -- If inline diff application fails (e.g., no UI), fall back to writing the file.
-  local ok, msg = utils.inline_diff.apply(abs_path, orig_lines, updated_lines)
-  if ok then
-    active_edit_state = {
-      bufnr = bufnr_from_list or vim.fn.bufadd(abs_path),
-      original_lines = orig_lines,
-    }
+  -- Best-effort diagnostics for AI self-correction (without opening the diff UI)
+  local diagnostics_text, diag_count = best_effort_diagnostics(abs_path, updated_lines)
 
-    -- Run diagnostics immediately and include a unified diff so the AI can self-correct before user review.
-    local diff_text = unified_diff(orig_lines, updated_lines)
-    local lsp_diag = require("neoai.ai_tools.lsp_diagnostic")
-    local diagnostics = lsp_diag.run({ file_path = abs_path, include_code_actions = false })
-
-    -- Compute diagnostics count on the target buffer (reflecting patched content)
-    local diag_count = 0
-    local target_buf = active_edit_state.bufnr
-    if target_buf then
-      pcall(lsp_diag.await_count, { bufnr = target_buf, timeout_ms = 1500 })
-      if vim.api.nvim_buf_is_loaded(target_buf) then
-        diag_count = #vim.diagnostic.get(target_buf)
-      end
-    end
-
-    -- Provide machine-readable markers for the orchestrator
-    local function simple_hash(s)
-      s = s or ""
-      local h1, h2 = 0, 0
-      for i = 1, #s do
-        local b = string.byte(s, i)
-        h1 = (h1 + b) % 4294967296
-        h2 = (h2 * 31 + b) % 4294967296
-      end
-      return string.format("%08x%08x_%d", h1, h2, #s)
-    end
-    local diff_hash = simple_hash(diff_text)
-
-    local parts = {
-      msg,
-      string.format(
-        "Edits summary: applied %d, skipped %d (already applied)",
-        total_replacements,
-        skipped_already_applied
-      ),
-      "Applied diff:",
-      utils.make_code_block(diff_text, "diff"),
-      diagnostics,
-      string.format("NeoAI-Diff-Hash: %s", diff_hash),
-      string.format("NeoAI-Diagnostics-Count: %d", diag_count),
-    }
-    -- Do not autosave here; wait for the user to review and write or cancel in the inline diff UI.
-    return table.concat(parts, "\n\n")
+  -- Do not open inline diff UI here; defer to end-of-turn review
+  -- Provide a compact, machine-friendly acknowledgement plus diagnostics back to the AI.
+  local parts = {
+    string.format("Queued edits for review in %s.", rel_path),
+    string.format(
+      "Edits summary: applied %d, skipped %d (already applied)",
+      total_replacements,
+      skipped_already_applied
+    ),
+  }
+  if diagnostics_text and diagnostics_text ~= "" then
+    table.insert(parts, diagnostics_text)
   else
-    -- Fallback write logic (ensures directories exist). Useful if the inline diff cannot be shown.
-    local dir = vim.fn.fnamemodify(abs_path, ":h")
-    pcall(vim.fn.mkdir, dir, "p")
-
-    local f, ferr = io.open(abs_path, "w")
-    if f then
-      f:write(table.concat(updated_lines, "\n"))
-      f:close()
-      return string.format("Wrote %s (inline diff failed: %s)", rel_path, msg or "unknown error")
-    end
-    return msg or ("Failed to open inline diff and could not write file: " .. tostring(ferr))
+    table.insert(
+      parts,
+      string.format("Diagnostics (post-edit, provisional): %d issue(s) detected.", tonumber(diag_count) or 0)
+    )
   end
+  return table.concat(parts, "\n\n")
 end
 
---- Open an accumulated, deferred inline diff review for the given file.
---- Shows a single review comparing the original baseline (before the first edit in the loop)
---- to the latest content after the AI's iterations.
----@param file_path string: Relative or absolute path to the file
----@return boolean, string
 function M.open_deferred_review(file_path)
   if type(file_path) ~= "string" or file_path == "" then
     return false, "Invalid file path"
@@ -569,7 +556,6 @@ function M.open_deferred_review(file_path)
     return false, "No pending deferred review for this file"
   end
 
-  -- If there are no differences, do not open the UI.
   local function lines_equal(a, b)
     if #a ~= #b then
       return false
@@ -588,19 +574,16 @@ function M.open_deferred_review(file_path)
 
   local ok, msg = utils.inline_diff.apply(abs_path, entry.baseline, entry.latest)
   if ok then
-    -- Prepare discard support: allow reverting to baseline if requested
     active_edit_state = {
       bufnr = vim.fn.bufadd(abs_path),
       original_lines = entry.baseline,
     }
-    -- Clear the accumulator now that the review is open
+    -- Clear just this file from the accumulator now that the review is open
     deferred_reviews[abs_path] = nil
   end
   return ok, msg
 end
 
---- Clear any stored deferred review for a file (if present).
----@param file_path string
 function M.clear_deferred_review(file_path)
   if type(file_path) ~= "string" or file_path == "" then
     return

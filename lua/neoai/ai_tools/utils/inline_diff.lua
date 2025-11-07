@@ -17,7 +17,6 @@ local DEFAULT_KEYS = {
   cancel = "q", -- cancel review and restore original file content
 }
 
--- These will only be used if the theme doesn't define the linked groups.
 local function ensure_highlights()
   local function set(name, opts)
     if vim.fn.hlexists(name) == 0 then
@@ -29,23 +28,18 @@ local function ensure_highlights()
   set("NeoAIInlineHint", { link = "Comment", default = true })
 end
 
--- This avoids opening it in file explorers or other non-editing windows.
 local function find_last_active_editing_window()
-  -- nvim_list_wins() is the API equivalent and has been around much longer.
   for _, win_handle in ipairs(vim.api.nvim_list_wins()) do
-    -- Check if the window is valid and currently shown
     if vim.api.nvim_win_is_valid(win_handle) then
       local bufnr = vim.api.nvim_win_get_buf(win_handle)
       local buf_type = vim.api.nvim_get_option_value("buftype", { buf = bufnr })
       local file_type = vim.api.nvim_get_option_value("filetype", { buf = bufnr })
-
-      -- We are looking for a normal buffer that is not a file explorer
       if buf_type == "" and file_type ~= "chadtree" and file_type ~= "NvimTree" then
-        return win_handle -- Return the window handle
+        return win_handle
       end
     end
   end
-  return 0 -- Fallback to current window
+  return 0
 end
 
 local function slice(tbl, s, e)
@@ -86,24 +80,12 @@ local function compute_patch(old_lines, new_lines)
   return patch
 end
 
--- Additional helpers for final outcome reporting
 local function unified_diff(old_lines, new_lines)
   local old_str = table.concat(old_lines or {}, "\n")
   local new_str = table.concat(new_lines or {}, "\n")
   ---@diagnostic disable-next-line: missing-fields
   local diff = vim.diff(old_str, new_str, { result_type = "unified", algorithm = "histogram" })
   return diff or "(no changes)"
-end
-
-local function simple_hash(s)
-  s = s or ""
-  local h1, h2 = 0, 0
-  for i = 1, #s do
-    local b = string.byte(s, i)
-    h1 = (h1 + b) % 4294967296
-    h2 = (h2 * 31 + b) % 4294967296
-  end
-  return string.format("%08x%08x_%d", h1, h2, #s)
 end
 
 -- ---
@@ -117,7 +99,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
     return false, "No changes detected"
   end
 
-  -- This makes the code much cleaner and easier to reason about than closures.
   local State = {
     bufnr = -1,
     augroup = -1,
@@ -126,10 +107,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
     keys = vim.tbl_deep_extend("force", DEFAULT_KEYS, (opts or {}).keys or {}),
     event_fired = false,
   }
-
-  -- ---
-  -- State and UI Management Functions (now methods of State)
-  -- ---
 
   function State:build_blocks()
     local patch = compute_patch(old_lines, new_lines)
@@ -197,14 +174,10 @@ function M.apply(abs_path, old_lines, new_lines, opts)
       self.keys.cancel
     )
 
-    -- Place the hint one line above the first line of the current diff hunk.
-    -- If the hunk starts at the top of the file, try to place it on the line below.
     local row
     if lnum > 1 then
-      -- 0-based row index for the line above the hunk start
       row = lnum - 2
     else
-      -- Hunk starts on the first line; prefer showing the hint on the second line if it exists
       local line_count = vim.api.nvim_buf_line_count(self.bufnr)
       row = (line_count >= 2) and 1 or 0
     end
@@ -241,10 +214,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
     end
   end
 
-  -- ---
-  -- Keymap Actions
-  -- ---
-
   function State:resolve_block(idx, keep_new_lines)
     local block = self.blocks[idx]
     if not block then
@@ -253,17 +222,14 @@ function M.apply(abs_path, old_lines, new_lines, opts)
 
     local distance = 0
     if not keep_new_lines then
-      -- Reverting to 'ours'. Replace new lines with old lines in the buffer.
       local start0 = math.max(0, block.new_start_line - 1)
       local end0 = math.max(start0, block.new_end_line)
       vim.api.nvim_buf_set_lines(self.bufnr, start0, end0, false, block.old_lines)
       distance = #block.old_lines - #block.new_lines
     end
 
-    -- Remove the resolved block from our list.
     table.remove(self.blocks, idx)
 
-    -- After a change, we must update the coordinates of all subsequent blocks.
     if distance ~= 0 then
       for i = idx, #self.blocks do
         self.blocks[i].new_start_line = self.blocks[i].new_start_line + distance
@@ -271,7 +237,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
       end
     end
 
-    -- Redraw all highlights based on the new state.
     self:highlight_blocks()
   end
 
@@ -281,7 +246,7 @@ function M.apply(abs_path, old_lines, new_lines, opts)
     if not idx then
       return
     end
-    self:resolve_block(idx, true) -- true = keep new lines
+    self:resolve_block(idx, true)
     self:goto_next()
   end
 
@@ -291,25 +256,20 @@ function M.apply(abs_path, old_lines, new_lines, opts)
     if not idx then
       return
     end
-    self:resolve_block(idx, false) -- false = revert to old lines
+    self:resolve_block(idx, false)
     self:goto_next()
   end
 
   function State:accept_all()
-    -- Mark all hunks as resolved and fire the close event (reuses goto_block finalisation)
     self.blocks = {}
-    -- Delegate to goto_block(nil) to cleanup, clear the active flag, and emit NeoAIInlineDiffClosed
     self:goto_block(nil)
   end
 
   function State:goto_block(block)
     if not block then
-      -- If no blocks left, save, cleanup and notify.
       if #self.blocks == 0 then
-        -- Clean up UI state first to avoid double events from BufWritePost
         self:cleanup()
 
-        -- Attempt to save the buffer so changes are persisted before resuming the AI
         local will_write, wrote_ok = false, false
         if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then
           local bt = vim.api.nvim_get_option_value("buftype", { buf = self.bufnr })
@@ -327,7 +287,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
 
         if not self.event_fired then
           self.event_fired = true
-          -- Prepare final outcome data for the AI/orchestrator
           local final_lines = {}
           if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then
             final_lines = vim.api.nvim_buf_get_lines(self.bufnr, 0, -1, false)
@@ -335,7 +294,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
             final_lines = vim.deepcopy(self.original_lines)
           end
           local diff_text = unified_diff(self.original_lines or {}, final_lines or {})
-          -- Await diagnostics publish for accuracy
           local diag_count = 0
           if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then
             pcall(function()
@@ -348,10 +306,8 @@ function M.apply(abs_path, old_lines, new_lines, opts)
             path = abs_path,
             bufnr = self.bufnr,
             diff = diff_text,
-            diff_hash = simple_hash(diff_text),
             diagnostics_count = diag_count,
           }
-          -- Mark review as inactive now that it is closed
           vim.g.neoai_inline_diff_active = false
           vim.schedule(function()
             pcall(vim.api.nvim_exec_autocmds, "User", {
@@ -403,10 +359,8 @@ function M.apply(abs_path, old_lines, new_lines, opts)
     self:cleanup()
     if not self.event_fired then
       self.event_fired = true
-      -- Prepare final outcome data (cancelled -> restored to original)
       local final_lines = vim.deepcopy(self.original_lines)
       local diff_text = unified_diff(self.original_lines or {}, final_lines or {})
-      -- Await diagnostics publish (reverted content)
       local diag_count = 0
       if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then
         pcall(function()
@@ -419,10 +373,8 @@ function M.apply(abs_path, old_lines, new_lines, opts)
         path = abs_path,
         bufnr = self.bufnr,
         diff = diff_text,
-        diff_hash = simple_hash(diff_text),
         diagnostics_count = diag_count,
       }
-      -- Mark review as inactive
       vim.g.neoai_inline_diff_active = false
       vim.schedule(function()
         pcall(vim.api.nvim_exec_autocmds, "User", {
@@ -446,13 +398,11 @@ function M.apply(abs_path, old_lines, new_lines, opts)
 
   local target_winnr = find_last_active_editing_window()
   vim.api.nvim_set_current_win(target_winnr)
-  -- Open the target file in this window without prompting to save the current buffer.
-  -- Using 'hide' avoids confirm prompts when the current buffer has unsaved changes.
   pcall(vim.cmd, "silent keepalt keepjumps hide edit " .. vim.fn.fnameescape(abs_path))
   State.bufnr = vim.api.nvim_get_current_buf()
   vim.bo[State.bufnr].modifiable = true
 
-  State.original_lines = old_lines -- Use original lines passed in for perfect restoration
+  State.original_lines = old_lines
   vim.api.nvim_buf_set_lines(State.bufnr, 0, -1, false, new_lines)
   State:highlight_blocks()
 
@@ -476,7 +426,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
         State:cleanup()
         if not State.event_fired then
           State.event_fired = true
-          -- Prepare final outcome data on write
           local final_lines = {}
           if State.bufnr and vim.api.nvim_buf_is_valid(State.bufnr) then
             final_lines = vim.api.nvim_buf_get_lines(State.bufnr, 0, -1, false)
@@ -484,7 +433,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
             final_lines = vim.deepcopy(State.original_lines)
           end
           local diff_text = unified_diff(State.original_lines or {}, final_lines or {})
-          -- Await diagnostics publish
           local diag_count = 0
           if State.bufnr and vim.api.nvim_buf_is_valid(State.bufnr) then
             pcall(function()
@@ -497,10 +445,8 @@ function M.apply(abs_path, old_lines, new_lines, opts)
             path = abs_path,
             bufnr = State.bufnr,
             diff = diff_text,
-            diff_hash = simple_hash(diff_text),
             diagnostics_count = diag_count,
           }
-          -- Mark review as inactive
           vim.g.neoai_inline_diff_active = false
           vim.schedule(function()
             pcall(vim.api.nvim_exec_autocmds, "User", {
@@ -522,7 +468,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
         State:cleanup()
         if not State.event_fired then
           State.event_fired = true
-          -- Prepare final outcome data on close
           local final_lines = {}
           if State.bufnr and vim.api.nvim_buf_is_valid(State.bufnr) then
             final_lines = vim.api.nvim_buf_get_lines(State.bufnr, 0, -1, false)
@@ -530,7 +475,6 @@ function M.apply(abs_path, old_lines, new_lines, opts)
             final_lines = vim.deepcopy(State.original_lines)
           end
           local diff_text = unified_diff(State.original_lines or {}, final_lines or {})
-          -- Await diagnostics publish
           local diag_count = 0
           if State.bufnr and vim.api.nvim_buf_is_valid(State.bufnr) then
             pcall(function()
@@ -543,10 +487,8 @@ function M.apply(abs_path, old_lines, new_lines, opts)
             path = abs_path,
             bufnr = State.bufnr,
             diff = diff_text,
-            diff_hash = simple_hash(diff_text),
             diagnostics_count = diag_count,
           }
-          -- Mark review as inactive
           vim.g.neoai_inline_diff_active = false
           vim.schedule(function()
             pcall(vim.api.nvim_exec_autocmds, "User", {
@@ -581,23 +523,17 @@ function M.apply(abs_path, old_lines, new_lines, opts)
   end, mapopts)
 
   State:goto_block(State.blocks[1])
-
-  -- Mark interactive review active
   vim.g.neoai_inline_diff_active = true
 
   local msg = string.format("🔍 Inline diff for %d change(s). Use keys to review.", #State.blocks)
   return true, msg
 end
 
--- Provide a best-effort close helper so callers can revert UI state when needed.
--- This cleans up highlights, keymaps, and autocommands for the buffer and
--- marks the review as inactive. It does not attempt to restore content.
 function M.close(bufnr)
   local b = bufnr or vim.api.nvim_get_current_buf()
   if b and vim.api.nvim_buf_is_valid(b) then
     pcall(vim.api.nvim_buf_clear_namespace, b, NAMESPACE, 0, -1)
     pcall(vim.api.nvim_buf_clear_namespace, b, HINT_NAMESPACE, 0, -1)
-    -- Remove buffer-local keymaps set by apply()
     local mapopts = { buffer = b }
     pcall(vim.keymap.del, { "n", "v" }, DEFAULT_KEYS.theirs, mapopts)
     pcall(vim.keymap.del, { "n", "v" }, DEFAULT_KEYS.ours, mapopts)
@@ -606,7 +542,6 @@ function M.close(bufnr)
     pcall(vim.keymap.del, { "n", "v" }, DEFAULT_KEYS.prev, mapopts)
     pcall(vim.keymap.del, { "n", "v" }, DEFAULT_KEYS.cancel, mapopts)
   end
-  -- Remove the augroup created by apply() if present
   local group_name = "neoai_inline_diff_" .. tostring(b)
   pcall(vim.api.nvim_del_augroup_by_name, group_name)
   vim.g.neoai_inline_diff_active = false
