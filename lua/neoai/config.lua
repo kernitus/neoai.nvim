@@ -8,7 +8,6 @@
 ---@field max_completion_tokens number|nil
 ---@field api_key_header string|nil
 ---@field api_key_format string|nil
----@field api_call_delay number|nil
 ---@field additional_kwargs? table<string, any>
 
 ---@class APISet
@@ -299,7 +298,6 @@ function config.set_defaults(opts)
     a.api_key_header = a.api_key_header or "Authorization"
     a.api_key_format = a.api_key_format or "Bearer %s"
     a.max_completion_tokens = a.max_completion_tokens or 4096
-    a.api_call_delay = a.api_call_delay or 0
   end
 
   return config.values

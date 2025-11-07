@@ -348,19 +348,6 @@ local function start_thinking_animation()
   )
 end
 
--- Apply rate limit delay before AI API calls
-local function apply_delay(callback)
-  local delay = require("neoai.config").get_api("main").api_call_delay or 0
-  if delay <= 0 then
-    callback()
-  else
-    vim.notify("NeoAI: Waiting " .. delay .. "ms for rate limit", vim.log.levels.INFO)
-    vim.defer_fn(function()
-      callback()
-    end, delay)
-  end
-end
-
 -- Ctrl-C cancel listener (global) so it works even if mappings are bypassed
 local CTRL_C_NS = vim.api.nvim_create_namespace("NeoAICtrlC")
 local CTRL_C_KEY = vim.api.nvim_replace_termcodes("<C-c>", true, false, true)
@@ -812,9 +799,7 @@ function chat.send_message()
 
   chat.add_message(MESSAGE_TYPES.USER, message)
   vim.api.nvim_buf_set_lines(chat.chat_state.buffers.input, 0, -1, false, { "" })
-  apply_delay(function()
-    chat.send_to_ai()
-  end)
+  chat.send_to_ai()
 end
 
 -- Send to AI

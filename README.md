@@ -405,6 +405,7 @@ All sessions are automatically saved to persistent JSON file.
 - **LSP Integration**: Debounced diagnostic collection and automatic code improvement workflows
 - **Performance Optimisations**: Better handling of large files and reduced unnecessary LSP calls
 - **Smart Indentation**: Improved handling of code indentation during edit operations
+- **Immediate Resumption**: Removed internal apply_delay; the chat and tool runner now resume immediately after sending a message or completing tools.
 
 ## Troubleshooting
 

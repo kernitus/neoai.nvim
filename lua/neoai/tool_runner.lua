@@ -1,25 +1,6 @@
 local M = {}
 local log = require("neoai.debug").log
 
--- Local apply_delay mirroring chat behaviour (without notify chatter)
-local function apply_delay(callback)
-  local delay = 0
-  local ok, cfg = pcall(require, "neoai.config")
-  if ok and cfg and type(cfg.get_api) == "function" then
-    local ok2, api = pcall(cfg.get_api, "main")
-    if ok2 and api and type(api.api_call_delay) == "number" then
-      delay = api.api_call_delay
-    end
-  end
-  if delay <= 0 then
-    callback()
-  else
-    vim.defer_fn(function()
-      callback()
-    end, delay)
-  end
-end
-
 -- Ensure each streamed tool schema has a stable id so we can pair responses.
 local function ensure_tool_ids(tool_schemas)
   local stamp = tostring(os.time())
@@ -148,10 +129,8 @@ function M.run_tool_calls(chat_module, tool_schemas)
   end
 
   if completed > 0 then
-    log("tool_runner: completed=%d | scheduling send_to_ai", completed)
-    apply_delay(function()
-      chat_module.send_to_ai()
-    end)
+    log("tool_runner: completed=%d | calling send_to_ai immediately", completed)
+    chat_module.send_to_ai()
     -- Watchdog: if the loop did not resume for some reason, try again explicitly.
     vim.defer_fn(function()
       local active = chat_module.chat_state and chat_module.chat_state.streaming_active
