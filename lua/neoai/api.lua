@@ -61,6 +61,10 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
   local http_status -- captured from curl --write-out
   local saw_any_chunk = false
 
+  -- Track stream completion and sentinel
+  local completed = false
+  local done_seen = false
+
   local basic_payload = {
     model = conf.model,
     max_completion_tokens = conf.max_completion_tokens,
@@ -223,6 +227,28 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     return out
   end
 
+  local function flush_pending_tool_calls()
+    if next(tool_call_acc) ~= nil then
+      local assembled = flush_tool_calls()
+      if #assembled > 0 then
+        on_chunk({ type = "tool_calls", data = assembled, complete = true })
+        return true
+      end
+    end
+    return false
+  end
+
+  local function mark_complete(reason)
+    if completed then
+      return
+    end
+    completed = true
+    log("api.stream: complete (%s) -> on_complete()", tostring(reason))
+    if not error_reported then
+      on_complete()
+    end
+  end
+
   local api_key_header = conf.api_key_header or "Authorization"
   local api_key_format = conf.api_key_format or "Bearer %s"
   local api_key_value = string.format(api_key_format, conf.api_key)
@@ -249,22 +275,19 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     writer = payload,
     on_stdout = function(_, line)
       for _, data_line in ipairs(vim.split(line, "\n")) do
-        if vim.startswith(data_line, "data: ") then
-          local chunk = data_line:sub(7)
+        -- Accept "data:" with or without a trailing space
+        if data_line:sub(1, 5) == "data:" then
+          local chunk = vim.trim(data_line:sub(6))
           saw_any_chunk = true
           vim.schedule(function()
             if chunk == "[DONE]" then
-              -- If we accumulated tool_calls but never saw finish_reason, flush them now
-              if not error_reported and next(tool_call_acc) ~= nil then
-                local assembled = flush_tool_calls()
-                if #assembled > 0 then
-                  on_chunk({ type = "tool_calls", data = assembled, complete = true })
-                end
+              done_seen = true
+              -- Flush any final tool_calls before completing
+              if not error_reported then
+                flush_pending_tool_calls()
               end
               log("api.stream: SSE [DONE] -> on_complete()")
-              if not error_reported then
-                on_complete()
-              end
+              mark_complete("SSE_DONE")
               return
             end
 
@@ -327,16 +350,42 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                   on_chunk({ type = "content", data = text })
                 end
                 handled = true
+              end
+
+              -- Optional: typed tool_call streaming support
+              if
+                t == "response.tool_call.delta"
+                or t == "message.tool_call.delta"
+                or t == "response.tool_calls.delta"
+              then
+                local calls = decoded.delta and decoded.delta.tool_calls
+                if
+                  not calls
+                  and decoded.delta
+                  and (decoded.delta["function"] or decoded.delta.id or decoded.delta.index)
+                then
+                  calls = { decoded.delta }
+                end
+                if not calls and decoded.tool_calls then
+                  calls = decoded.tool_calls
+                end
+                if calls then
+                  acc_tool_calls(calls)
+                end
+                handled = true
+              elseif t == "response.tool_call.completed" or t == "message.tool_call.completed" then
+                local flushed = flush_pending_tool_calls()
+                if flushed then
+                  log("api.stream: typed tool_call.completed -> flushed")
+                end
+                handled = true
               elseif t == "response.completed" or t == "response.done" then
                 -- Defensive: flush any pending tool_calls before completing
-                if not error_reported and next(tool_call_acc) ~= nil then
-                  local assembled = flush_tool_calls()
-                  if #assembled > 0 then
-                    on_chunk({ type = "tool_calls", data = assembled, complete = true })
-                  end
+                if not error_reported then
+                  flush_pending_tool_calls()
                 end
                 log("api.stream: response.completed -> on_complete()")
-                on_complete()
+                mark_complete("typed_completed")
                 handled = true
               end
             end
@@ -362,10 +411,15 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 local finished_reason = choice.finish_reason
                 if finished_reason == "stop" then
                   log("api.stream: on_complete() via finish_reason=stop")
-                  on_complete()
+                  mark_complete("finish_reason_stop")
                 elseif finished_reason == "tool_calls" then
-                  log("api.stream: finish_reason=tool_calls | deferring completion to [DONE]")
-                  -- Do NOT call on_complete here; [DONE] will flush tool_calls and complete
+                  -- Flush accumulated tool_calls immediately so the runner can start assembling UI state now.
+                  local flushed = flush_pending_tool_calls()
+                  log(
+                    "api.stream: finish_reason=tool_calls | flushed=%s; waiting for [DONE] (with exit fallback)",
+                    tostring(flushed)
+                  )
+                  -- Do not mark complete here; either [DONE] will arrive, or on_exit will finalise.
                 end
               end
             end
@@ -435,10 +489,12 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     on_exit = function(j, exit_code)
       vim.schedule(function()
         log(
-          "api.stream: on_exit | exit_code=%s saw_any_chunk=%s http_status=%s",
+          "api.stream: on_exit | exit_code=%s saw_any_chunk=%s http_status=%s done_seen=%s completed=%s",
           tostring(exit_code),
           tostring(saw_any_chunk),
-          tostring(http_status)
+          tostring(http_status),
+          tostring(done_seen),
+          tostring(completed)
         )
         if current_job == j then
           current_job = nil
@@ -466,6 +522,17 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 on_error(verbose)
               end
             end
+          end
+
+          -- Fallback: if stream ended without [DONE]/typed completed but we did receive chunks,
+          -- flush pending tool_calls and complete once.
+          if not j._neoai_cancelled and not error_reported and saw_any_chunk and not completed then
+            local flushed = flush_pending_tool_calls()
+            if flushed then
+              log("api.stream: on_exit fallback -> flushed pending tool_calls")
+            end
+            -- Even if nothing to flush, mark complete so the UI/runner can progress.
+            mark_complete("on_exit_without_DONE")
           end
 
           -- If a next stream was queued whilst this one was active, start it now.
