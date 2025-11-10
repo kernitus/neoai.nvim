@@ -170,6 +170,18 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
       if f.arguments and f.arguments ~= "" then
         local prev = tool_call_acc[key]["function"].arguments or ""
         tool_call_acc[key]["function"].arguments = prev .. f.arguments
+
+        -- Log accumulation for large tool calls
+        local total = #tool_call_acc[key]["function"].arguments
+        if total > 30000 then
+          log(
+            "acc_tool_calls: id=%s name=%s total_bytes=%d delta_bytes=%d",
+            tostring(key),
+            tostring(tool_call_acc[key]["function"].name),
+            total,
+            #f.arguments
+          )
+        end
       end
     end
   end
@@ -178,6 +190,21 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     if #tool_call_order == 0 then
       return {}
     end
+
+    -- Log final sizes before flushing
+    for _, id in ipairs(tool_call_order) do
+      local tc = tool_call_acc[id]
+      local args_len = tc and tc["function"] and #(tc["function"].arguments or "") or 0
+      if args_len > 0 then
+        log(
+          "flush_tool_calls: id=%s name=%s final_args_bytes=%d",
+          tostring(id),
+          tostring(tc and tc["function"] and tc["function"].name),
+          args_len
+        )
+      end
+    end
+
     table.sort(tool_call_order, function(a, b)
       local ia = tool_call_acc[a] and tool_call_acc[a].index or math.huge
       local ib = tool_call_acc[b] and tool_call_acc[b].index or math.huge
@@ -333,15 +360,12 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 end
 
                 local finished_reason = choice.finish_reason
-                if finished_reason == "tool_calls" then
-                  local assembled = flush_tool_calls()
-                  if #assembled > 0 then
-                    on_chunk({ type = "tool_calls", data = assembled, complete = true })
-                  end
-                end
-                if finished_reason == "stop" or finished_reason == "tool_calls" then
-                  log("api.stream: on_complete() via finish_reason=%s", tostring(finished_reason))
+                if finished_reason == "stop" then
+                  log("api.stream: on_complete() via finish_reason=stop")
                   on_complete()
+                elseif finished_reason == "tool_calls" then
+                  log("api.stream: finish_reason=tool_calls | deferring completion to [DONE]")
+                  -- Do NOT call on_complete here; [DONE] will flush tool_calls and complete
                 end
               end
             end

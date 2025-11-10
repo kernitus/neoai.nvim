@@ -168,7 +168,7 @@ config.defaults = {
           max_completion_tokens = 128000,
           additional_kwargs = {
             temperature = 1,
-            reasoning_effort = "high",
+            reasoning_effort = "medium",
           },
         },
         small = {
@@ -178,6 +178,7 @@ config.defaults = {
           max_completion_tokens = 128000,
           additional_kwargs = {
             temperature = 1,
+            reasoning_effort = "minimal",
           },
         },
       },

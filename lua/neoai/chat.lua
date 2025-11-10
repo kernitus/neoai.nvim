@@ -486,11 +486,10 @@ function chat.setup()
     _iter_map = {}, -- Track per-file iteration state for edit+diagnostic loop
     awaiting_user_review = false,
     _review_queue = nil,
-
-    -- Added: turn-level orchestration aids
     _last_tool_turn_ts = 0, -- os.time() of last tool-run turn
     _empty_turn_retry_used = false, -- guard to avoid infinite retries
     _consecutive_silent_turns = 0,
+    _plan_without_action_count = 0,
   }
 
   -- Bridge inline diff outcome to chat as a user-visible message
@@ -1230,29 +1229,48 @@ function chat.stream_ai_response(messages)
       chat.chat_state.streaming_active = false
 
       local silent = (content or "") == ""
-      if silent then
-        -- Aggressive auto-resume: allow up to 5 retries if we keep getting silent turns after tools
-        chat.chat_state._consecutive_silent_turns = (chat.chat_state._consecutive_silent_turns or 0) + 1
-        local max_retries = 5
-        local now = os.time()
-        local recent_tool = chat.chat_state._last_tool_turn_ts > 0
-          and ((now - chat.chat_state._last_tool_turn_ts) <= 30)
+      local now = os.time()
+      local recent_tool = chat.chat_state._last_tool_turn_ts > 0 and ((now - chat.chat_state._last_tool_turn_ts) <= 180)
 
-        if recent_tool and chat.chat_state._consecutive_silent_turns <= max_retries then
-          log("chat: empty turn #%d after tools; auto-resume", chat.chat_state._consecutive_silent_turns)
-          vim.schedule(function()
-            chat.send_to_ai()
-          end)
-          return
-        else
-          log("chat: max retries (%d) reached or no recent tool; stop", max_retries)
+      local should_resume = false
+      local resume_reason = ""
+
+      if recent_tool then
+        if silent then
+          chat.chat_state._consecutive_silent_turns = (chat.chat_state._consecutive_silent_turns or 0) + 1
+          if chat.chat_state._consecutive_silent_turns <= 5 then
+            should_resume = true
+            resume_reason = string.format("silent turn #%d after tools", chat.chat_state._consecutive_silent_turns)
+          else
+            log("chat: max silent retries (5) reached")
+          end
+        elseif
+          content:match("[Pp]roceeding")
+          or content:match("[Ww]ill read")
+          or content:match("[Ww]ill implement")
+          or content:match("[Ww]ill apply")
+        then
+          chat.chat_state._plan_without_action_count = (chat.chat_state._plan_without_action_count or 0) + 1
+          if chat.chat_state._plan_without_action_count <= 3 then
+            should_resume = true
+            resume_reason = string.format("plan-without-action #%d", chat.chat_state._plan_without_action_count)
+          else
+            log("chat: max plan-without-action retries (3) reached")
+          end
         end
       else
-        -- Non-silent turn: reset retry counter
         chat.chat_state._consecutive_silent_turns = 0
+        chat.chat_state._plan_without_action_count = 0
       end
 
-      -- Either gave up or got real content
+      if should_resume then
+        log("chat: auto-resume after %s", resume_reason)
+        vim.schedule(function()
+          chat.send_to_ai()
+        end)
+        return
+      end
+
       if silent then
         log("chat: skip persisting empty assistant message")
       end
