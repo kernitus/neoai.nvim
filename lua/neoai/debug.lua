@@ -1,24 +1,32 @@
 local M = {}
 
-local function log_path()
-  return vim.fn.stdpath("cache") .. "/neoai.log"
-end
+local dir = vim.fn.stdpath("data") .. "/neoai_logs"
+pcall(vim.fn.mkdir, dir, "p")
+local logfile = dir .. "/neoai.log"
 
-function M.clear()
-  pcall(os.remove, log_path())
+local function safe_fmt(fmt, ...)
+  local ok, msg = pcall(string.format, fmt, ...)
+  if ok then
+    return msg
+  end
+  return tostring(fmt)
 end
 
 function M.log(fmt, ...)
-  if not vim.g.neoai_debug then
-    return
-  end
-  local ok, line = pcall(string.format, fmt, ...)
-  local msg = (ok and line) or fmt
-  local f = io.open(log_path(), "a")
-  if f then
-    f:write(os.date("%Y-%m-%d %H:%M:%S ") .. msg .. "\n")
+  local line = string.format("[%s] %s", os.date("%Y-%m-%d %H:%M:%S"), safe_fmt(fmt, ...))
+  local ok, f = pcall(io.open, logfile, "a")
+  if ok and f then
+    f:write(line .. "\n")
     f:close()
+  else
+    vim.schedule(function()
+      vim.notify("NeoAI log fallback: " .. line, vim.log.levels.DEBUG, { title = "NeoAI" })
+    end)
   end
+end
+
+function M.path()
+  return logfile
 end
 
 return M

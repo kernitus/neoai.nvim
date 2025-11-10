@@ -486,6 +486,11 @@ function chat.setup()
     _iter_map = {}, -- Track per-file iteration state for edit+diagnostic loop
     awaiting_user_review = false,
     _review_queue = nil,
+
+    -- Added: turn-level orchestration aids
+    _last_tool_turn_ts = 0, -- os.time() of last tool-run turn
+    _empty_turn_retry_used = false, -- guard to avoid infinite retries
+    _consecutive_silent_turns = 0,
   }
 
   -- Bridge inline diff outcome to chat as a user-visible message
@@ -976,6 +981,11 @@ end
 ---@param tool_schemas table
 function chat.get_tool_calls(tool_schemas)
   log("chat.get_tool_calls: start | n=%d", #(tool_schemas or {}))
+  -- Mark that we just entered a tool-call turn and reset empty-turn retry guard
+  chat.chat_state._last_tool_turn_ts = os.time()
+  chat.chat_state._empty_turn_retry_used = false
+  chat.chat_state._consecutive_silent_turns = 0
+
   for _, sc in ipairs(tool_schemas or {}) do
     local name = sc and sc["function"] and sc["function"].name or "<nil>"
     log("chat.get_tool_calls: schema | idx=%s id=%s name=%s", tostring(sc and sc.index), tostring(sc and sc.id), name)
@@ -1216,13 +1226,35 @@ function chat.stream_ai_response(messages)
     if #tool_calls_response > 0 then
       chat.get_tool_calls(tool_calls_response)
     else
-      -- Genuine stop: no more tools, possibly no text. Mark stream done and open any deferred reviews.
+      -- No more tools; end of turn.
       chat.chat_state.streaming_active = false
 
-      if (content or "") == "" then
-        -- Add a tiny assistant message so the turn has a visible end
-        chat.add_message(MESSAGE_TYPES.ASSISTANT, "(no textual output)")
-        update_chat_display()
+      local silent = (content or "") == ""
+      if silent then
+        -- Aggressive auto-resume: allow up to 5 retries if we keep getting silent turns after tools
+        chat.chat_state._consecutive_silent_turns = (chat.chat_state._consecutive_silent_turns or 0) + 1
+        local max_retries = 5
+        local now = os.time()
+        local recent_tool = chat.chat_state._last_tool_turn_ts > 0
+          and ((now - chat.chat_state._last_tool_turn_ts) <= 30)
+
+        if recent_tool and chat.chat_state._consecutive_silent_turns <= max_retries then
+          log("chat: empty turn #%d after tools; auto-resume", chat.chat_state._consecutive_silent_turns)
+          vim.schedule(function()
+            chat.send_to_ai()
+          end)
+          return
+        else
+          log("chat: max retries (%d) reached or no recent tool; stop", max_retries)
+        end
+      else
+        -- Non-silent turn: reset retry counter
+        chat.chat_state._consecutive_silent_turns = 0
+      end
+
+      -- Either gave up or got real content
+      if silent then
+        log("chat: skip persisting empty assistant message")
       end
 
       vim.schedule(function()

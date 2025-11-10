@@ -9,6 +9,9 @@ local api = {}
 --- @type Job|nil  -- Current streaming job
 local current_job = nil
 
+-- Single queued stream request (if a new request arrives whilst one is active)
+local queued_stream = nil
+
 --- Merges two tables into a new one.
 --- @param t1 table  -- The first table
 --- @param t2 table  -- The second table
@@ -37,9 +40,23 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     #(tool_schemas or {}),
     tostring(conf.model)
   )
+
+  -- If a stream is already active, queue this request and start it when the current job exits.
+  if current_job ~= nil then
+    log("api.stream: busy; queuing next stream request")
+    queued_stream = {
+      messages = messages,
+      on_chunk = on_chunk,
+      on_complete = on_complete,
+      on_error = on_error,
+      on_cancel = on_cancel,
+    }
+    return
+  end
+
   -- Track if we've already reported an error to avoid duplicate notifications
   local error_reported = false
-  -- Buffer non-SSE stdout to recover JSON error bodies when the server doesn't stream
+  -- Buffer non-SSE stdout to recover JSON error bodies when the server does not stream
   local non_sse_buf = {}
   local http_status -- captured from curl --write-out
   local saw_any_chunk = false
@@ -59,6 +76,125 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
   end
 
   local raw_body_chunks = {}
+
+  -- Accumulate streamed tool_call arguments across deltas and flush on finish
+  local tool_call_acc = {} -- key (id or idx_*) -> schema
+  local tool_call_order = {} -- stable first-seen order
+  local index_to_key = {} -- index -> current authoritative key (for re-routing after merge)
+
+  local function acc_tool_calls(calls)
+    for _, tc in ipairs(calls or {}) do
+      local f = tc["function"] or {}
+      local real_id = tc.id
+      local idx = tc.index
+
+      -- Determine the authoritative key for this index
+      local key
+      if idx ~= nil and index_to_key[idx] then
+        -- We already have a key for this index (either idx_* or real_id from a previous delta)
+        key = index_to_key[idx]
+      elseif real_id and real_id ~= "" then
+        -- First time seeing this index with a real id
+        key = real_id
+        if idx ~= nil then
+          index_to_key[idx] = real_id
+        end
+      else
+        -- First time seeing this index, no real id yet
+        key = "idx_" .. tostring(idx or (#tool_call_order + 1))
+        if idx ~= nil then
+          index_to_key[idx] = key
+        end
+      end
+
+      -- If we just learned the real_id for an index that was previously idx_*, migrate the entry
+      if real_id and real_id ~= "" and idx ~= nil then
+        local old_key = "idx_" .. tostring(idx)
+        if old_key ~= key and tool_call_acc[old_key] then
+          -- Migrate idx_* entry to real_id
+          local stub = tool_call_acc[old_key]
+          tool_call_acc[old_key] = nil
+
+          if not tool_call_acc[key] then
+            tool_call_acc[key] = {
+              id = real_id,
+              index = stub.index or idx,
+              type = "function",
+              ["function"] = {
+                name = (f.name and f.name ~= "" and f.name) or (stub["function"] and stub["function"].name) or "",
+                arguments = (stub["function"] and stub["function"].arguments) or "",
+              },
+            }
+          else
+            -- Merge arguments if both exist
+            local early = (stub["function"] and stub["function"].arguments) or ""
+            local existing = (tool_call_acc[key]["function"] and tool_call_acc[key]["function"].arguments) or ""
+            tool_call_acc[key]["function"].arguments = early .. existing
+            if (tool_call_acc[key]["function"].name or "") == "" then
+              tool_call_acc[key]["function"].name = (f.name and f.name ~= "" and f.name)
+                or (stub["function"] and stub["function"].name)
+                or ""
+            end
+          end
+
+          -- Update order list
+          for i, k in ipairs(tool_call_order) do
+            if k == old_key then
+              tool_call_order[i] = key
+              break
+            end
+          end
+
+          -- Update mapping
+          index_to_key[idx] = key
+        end
+      end
+
+      -- Ensure entry exists
+      if not tool_call_acc[key] then
+        tool_call_acc[key] = {
+          id = real_id or key,
+          index = idx,
+          type = "function",
+          ["function"] = { name = f.name or "", arguments = "" },
+        }
+        table.insert(tool_call_order, key)
+      end
+
+      -- Update name (prefer non-empty)
+      if f.name and f.name ~= "" then
+        tool_call_acc[key]["function"].name = f.name
+      end
+
+      -- Append streamed arguments
+      if f.arguments and f.arguments ~= "" then
+        local prev = tool_call_acc[key]["function"].arguments or ""
+        tool_call_acc[key]["function"].arguments = prev .. f.arguments
+      end
+    end
+  end
+
+  local function flush_tool_calls()
+    if #tool_call_order == 0 then
+      return {}
+    end
+    table.sort(tool_call_order, function(a, b)
+      local ia = tool_call_acc[a] and tool_call_acc[a].index or math.huge
+      local ib = tool_call_acc[b] and tool_call_acc[b].index or math.huge
+      if ia == ib then
+        return tostring(a) < tostring(b)
+      end
+      return ia < ib
+    end)
+    local out = {}
+    for _, id in ipairs(tool_call_order) do
+      table.insert(out, tool_call_acc[id])
+    end
+    tool_call_acc = {}
+    tool_call_order = {}
+    index_to_key = {} -- Clear mapping
+    return out
+  end
 
   local api_key_header = conf.api_key_header or "Authorization"
   local api_key_format = conf.api_key_format or "Bearer %s"
@@ -91,6 +227,13 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
           saw_any_chunk = true
           vim.schedule(function()
             if chunk == "[DONE]" then
+              -- If we accumulated tool_calls but never saw finish_reason, flush them now
+              if not error_reported and next(tool_call_acc) ~= nil then
+                local assembled = flush_tool_calls()
+                if #assembled > 0 then
+                  on_chunk({ type = "tool_calls", data = assembled, complete = true })
+                end
+              end
               log("api.stream: SSE [DONE] -> on_complete()")
               if not error_reported then
                 on_complete()
@@ -158,6 +301,13 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 end
                 handled = true
               elseif t == "response.completed" or t == "response.done" then
+                -- Defensive: flush any pending tool_calls before completing
+                if not error_reported and next(tool_call_acc) ~= nil then
+                  local assembled = flush_tool_calls()
+                  if #assembled > 0 then
+                    on_chunk({ type = "tool_calls", data = assembled, complete = true })
+                  end
+                end
                 log("api.stream: response.completed -> on_complete()")
                 on_complete()
                 handled = true
@@ -179,15 +329,16 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                   on_chunk({ type = "content", data = content })
                 end
                 if tool_calls then
-                  local ids = {}
-                  for _, tc in ipairs(tool_calls) do
-                    table.insert(ids, tostring(tc.id or ("<nil>#" .. tostring(tc.index))))
-                  end
-                  log("api.stream: emit tool_calls | n=%d ids=%s", #tool_calls, table.concat(ids, ","))
-                  on_chunk({ type = "tool_calls", data = tool_calls })
+                  acc_tool_calls(tool_calls)
                 end
 
                 local finished_reason = choice.finish_reason
+                if finished_reason == "tool_calls" then
+                  local assembled = flush_tool_calls()
+                  if #assembled > 0 then
+                    on_chunk({ type = "tool_calls", data = assembled, complete = true })
+                  end
+                end
                 if finished_reason == "stop" or finished_reason == "tool_calls" then
                   log("api.stream: on_complete() via finish_reason=%s", tostring(finished_reason))
                   on_complete()
@@ -267,6 +418,8 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
         )
         if current_job == j then
           current_job = nil
+
+          -- Handle curl process exit statuses and HTTP errors first
           if j._neoai_cancelled then
             if on_cancel then
               on_cancel()
@@ -289,6 +442,17 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 on_error(verbose)
               end
             end
+          end
+
+          -- If a next stream was queued whilst this one was active, start it now.
+          if queued_stream then
+            local q = queued_stream
+            queued_stream = nil
+            log("api.stream: starting queued stream request")
+            vim.schedule(function()
+              api.stream(q.messages, q.on_chunk, q.on_complete, q.on_error, q.on_cancel)
+            end)
+            return
           end
         end
       end)

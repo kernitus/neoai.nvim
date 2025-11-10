@@ -245,17 +245,11 @@ function M.run_tool_calls(chat_module, tool_schemas)
   end
 
   if completed > 0 then
-    log("tool_runner: completed=%d | calling send_to_ai immediately", completed)
-    chat_module.send_to_ai()
-    -- Watchdog: if the loop did not resume for some reason, try again explicitly.
-    vim.defer_fn(function()
-      local active = chat_module.chat_state and chat_module.chat_state.streaming_active
-      log("tool_runner: watchdog 800ms | streaming_active=%s", tostring(active))
-      if not active then
-        log("tool_runner: watchdog re-invoking send_to_ai()")
-        pcall(chat_module.send_to_ai)
-      end
-    end, 800)
+    -- Always schedule the resume. api.stream will either start immediately or queue it whilst the current stream winds down.
+    log("tool_runner: completed=%d | scheduling send_to_ai()", completed)
+    vim.schedule(function()
+      chat_module.send_to_ai()
+    end)
   else
     c.streaming_active = false
   end
