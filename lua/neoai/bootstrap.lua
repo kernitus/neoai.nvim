@@ -127,6 +127,10 @@ function M.run_preflight(chat_module, boot_cfg)
     tool_calls
   )
   execute_and_persist(chat_module, tool_calls, spec_args_map)
+  -- Mark that a tool turn just occurred so auto-resume can proceed if the assistant plans without calling
+  if chat_module and chat_module.chat_state then
+    chat_module.chat_state._last_tool_turn_ts = os.time()
+  end
 end
 
 return M

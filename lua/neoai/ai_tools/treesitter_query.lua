@@ -15,38 +15,51 @@ M.meta = {
       },
       file_path = {
         type = "string",
-        description = string.format(
-          "(Optional) Path to the file to inspect (relative to cwd %s). If omitted, uses current buffer.",
-          vim.fn.getcwd()
-        ),
+        description = "Path to the file to inspect (relative to cwd). Use empty string to mean current buffer.",
+        default = "",
       },
       language = {
         type = "string",
-        description = "(Optional) Force language name (e.g., 'lua', 'python'). If omitted, detected from buffer.",
+        description = "Force language name (e.g., 'lua', 'python'). Use empty string to auto-detect from buffer.",
+        default = "",
       },
       include_text = {
         type = "boolean",
-        description = "(Optional) Include matched node text in results. Default: true.",
+        description = "Include matched node text in results.",
+        default = true,
       },
       include_ranges = {
         type = "boolean",
-        description = "(Optional) Include start/end ranges (1-based line:col). Default: true.",
+        description = "Include start/end ranges (1-based line:col).",
+        default = true,
       },
       captures = {
         type = "array",
         items = { type = "string" },
-        description = "(Optional) Only include these @capture names (e.g., ['@func', 'name']).",
+        description = "Only include these @capture names (e.g., ['@func', '@name']). Use empty array to include all captures.",
+        default = {},
       },
       first_only = {
         type = "boolean",
-        description = "(Optional) Return only the first match for brevity.",
+        description = "Return only the first match for brevity.",
+        default = false,
       },
       max_results = {
         type = "integer",
-        description = "(Optional) Maximum number of matches to return (safeguard).",
+        description = "Maximum number of matches to return (safeguard).",
+        default = 500,
       },
     },
-    required = { "query" },
+    required = {
+      "query",
+      "file_path",
+      "language",
+      "include_text",
+      "include_ranges",
+      "captures",
+      "first_only",
+      "max_results",
+    },
     additionalProperties = false,
   },
 }
@@ -55,7 +68,7 @@ M.meta = {
 --- @param file_path string: The path to the file.
 --- @return integer: The buffer number.
 local function get_bufnr_for_path(file_path)
-  if file_path and #file_path > 0 then
+  if file_path and type(file_path) == "string" and #file_path > 0 then
     local bufnr = vim.fn.bufnr(file_path, true)
     vim.fn.bufload(bufnr)
     return bufnr
@@ -193,16 +206,28 @@ end
 M.run = function(args)
   args = args or {}
   local query = args.query
-  if not query or #query == 0 then
+  if not query or type(query) ~= "string" or #query == 0 then
     return "Error: 'query' is required."
   end
 
-  local bufnr = get_bufnr_for_path(args.file_path)
-  if not vim.api.nvim_buf_is_loaded(bufnr) then
-    return "Failed to load buffer for: " .. tostring(args.file_path)
+  -- Coerce file_path: empty string → current buffer
+  local file_path = args.file_path
+  if type(file_path) ~= "string" or file_path == "" then
+    file_path = nil
   end
 
-  local lang = args.language or detect_lang(bufnr)
+  local bufnr = get_bufnr_for_path(file_path)
+  if not vim.api.nvim_buf_is_loaded(bufnr) then
+    return "Failed to load buffer for: " .. tostring(file_path or "current buffer")
+  end
+
+  -- Coerce language: empty string → auto-detect
+  local lang = args.language
+  if type(lang) ~= "string" or lang == "" then
+    lang = nil
+  end
+  lang = lang or detect_lang(bufnr)
+
   local parser, perr = get_parser(bufnr, lang)
   if not parser then
     return perr or ("Failed to get parser for buffer (lang=" .. tostring(lang) .. ")")
@@ -213,13 +238,15 @@ M.run = function(args)
     return "Query parse error: " .. tostring(qerr)
   end
 
-  -- Defaults
-  local include_text = args.include_text ~= false -- default true
-  local include_ranges = args.include_ranges ~= false -- default true
-  local first_only = args.first_only == true
-  local max_results = args.max_results or 500
+  -- Coerce booleans with defaults
+  local include_text = (args.include_text ~= false) -- default true
+  local include_ranges = (args.include_ranges ~= false) -- default true
+  local first_only = (args.first_only == true) -- default false
 
-  -- Optional filter set for capture names
+  -- Coerce max_results with default
+  local max_results = tonumber(args.max_results) or 500
+
+  -- Coerce captures: empty array means no filter (all captures)
   local capture_filter
   if type(args.captures) == "table" and #args.captures > 0 then
     capture_filter = {}

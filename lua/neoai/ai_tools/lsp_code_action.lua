@@ -9,15 +9,18 @@ M.meta = {
     properties = {
       file_path = {
         type = "string",
-        description = string.format(
-          "(Optional) Path to the file to inspect (relative to cwd %s). If omitted, uses current buffer.",
-          vim.fn.getcwd()
-        ),
+        description = "Path to the file to inspect (relative to cwd). Use empty string to mean current buffer.",
+        default = "",
       },
       action_index = {
         type = "integer",
-        description = "The index of the code action to apply. If omitted, the tool will list available actions.",
+        description = "Index of the code action to apply (1-based). Use 0 to list available actions without applying.",
+        default = 0,
       },
+    },
+    required = {
+      "file_path",
+      "action_index",
     },
     additionalProperties = false,
   },
@@ -26,25 +29,33 @@ M.meta = {
 ---
 --- Runs the LSP code action with the given arguments.
 ---
---- @param args table: A table containing optional parameters:
---- - `file_path` (string, optional): Path to the file to inspect, relative to cwd.
---- - `action_index` (integer, optional): Index of the code action to apply. Lists actions if omitted.
+--- @param args table: A table containing parameters:
+--- - `file_path` (string): Path to the file to inspect, relative to cwd. Empty string means current buffer.
+--- - `action_index` (integer): Index of the code action to apply (1-based). 0 means list actions without applying.
 ---
 M.run = function(args)
   args = args or {}
+
+  -- Coerce file_path to current buffer when empty
+  local file_path = args.file_path
+  if type(file_path) ~= "string" or file_path == "" then
+    file_path = nil
+  end
+
   ---@type integer
   local bufnr
-  if args.file_path and #args.file_path > 0 then
-    bufnr = vim.fn.bufnr(args.file_path, true)
+  if file_path then
+    bufnr = vim.fn.bufnr(file_path, true)
     vim.fn.bufload(bufnr)
   else
     bufnr = vim.api.nvim_get_current_buf()
-    args.file_path = vim.api.nvim_buf_get_name(bufnr)
+    file_path = vim.api.nvim_buf_get_name(bufnr)
   end
 
   if not vim.api.nvim_buf_is_loaded(bufnr) then
-    return "Failed to load buffer: " .. tostring(args.file_path)
+    return "Failed to load buffer: " .. tostring(file_path)
   end
+
   ---@type table
   local params = vim.lsp.util.make_range_params()
   params.context = { diagnostics = vim.diagnostic.get(bufnr) }
@@ -53,26 +64,29 @@ M.run = function(args)
   ---@type table
   local actions = {}
   for _, res in pairs(results) do
-    for _, action in ipairs(res) do
-      table.insert(actions, action)
+    if res.result then
+      for _, action in ipairs(res.result) do
+        table.insert(actions, action)
+      end
     end
   end
 
   -- If no actions available
   if #actions == 0 then
-    return utils.make_code_block("✅ No code actions available for: " .. (args.file_path or bufnr), "txt")
+    return utils.make_code_block("✅ No code actions available for: " .. (file_path or tostring(bufnr)), "txt")
   end
 
-  -- If action_index provided, execute that action
-  if args.action_index then
-    local idx = args.action_index
-    if type(idx) ~= "number" or idx < 1 or idx > #actions then
-      return "Invalid action_index: " .. tostring(idx)
+  -- Coerce action_index: 0 or negative means list only
+  local action_index = tonumber(args.action_index) or 0
+  if action_index > 0 then
+    -- Execute the specified action
+    if action_index > #actions then
+      return "Invalid action_index: " .. tostring(action_index) .. " (only " .. #actions .. " actions available)"
     end
-    local action = actions[idx]
+    local action = actions[action_index]
     -- Apply workspace edit if present
     if action.edit then
-      vim.lsp.util.apply_workspace_edit(action.edit)
+      vim.lsp.util.apply_workspace_edit(action.edit, "utf-8")
     end
     -- Execute command if present
     if action.command then
@@ -80,6 +94,8 @@ M.run = function(args)
     end
     return "Applied code action: " .. action.title
   end
+
+  -- List available actions
   ---@type table
   local titles = {}
   for i, action in ipairs(actions) do

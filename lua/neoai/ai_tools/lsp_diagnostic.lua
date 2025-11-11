@@ -10,24 +10,28 @@ M.meta = {
     properties = {
       include_code_actions = {
         type = "boolean",
-        description = "(Optional) When true, also retrieve available code actions for the file.",
+        description = "When true, also retrieve available code actions for the file.",
+        default = false,
       },
       file_path = {
         type = "string",
-        description = string.format(
-          "(Optional) Path to the file to inspect (relative to cwd %s). If omitted, uses current buffer.",
-          vim.fn.getcwd()
-        ),
+        description = "Path to the file to inspect (relative to cwd). Use empty string to mean current buffer.",
+        default = "",
       },
       bufnr = {
         type = "integer",
-        description = "(Internal) Optional buffer number to inspect. Prefer file_path for external calls.",
+        description = "Buffer number to inspect. Use 0 to mean current buffer.",
+        default = 0,
       },
+    },
+    required = {
+      "include_code_actions",
+      "file_path",
+      "bufnr",
     },
     additionalProperties = false,
   },
 }
-
 --- Internal: resolve a buffer number from args
 ---@param args table
 ---@return integer|nil

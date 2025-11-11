@@ -10,49 +10,70 @@ M.meta = {
     properties = {
       path = {
         type = "string",
-        description = "Root path to scan. Defaults to current working directory.",
+        description = "Root path to scan. Use '.' for current working directory.",
+        default = ".",
       },
       files = {
         type = "array",
         items = { type = "string" },
-        description = "Optional explicit list of files to scan (relative to cwd). Overrides path/globs when present.",
+        description = "Explicit list of files to scan (relative to cwd). When non-empty, overrides path/globs. Use empty array to auto-discover via globs.",
+        default = {},
       },
       globs = {
         type = "array",
         items = { type = "string" },
-        description = "Ripgrep -g patterns to include (e.g. ['**/*.lua','**/*.py']).",
+        description = "Ripgrep -g patterns to include (e.g. ['**/*.lua','**/*.py']). Used when files array is empty.",
+        default = { "**/*" },
       },
       languages = {
         type = "array",
         items = { type = "string" },
-        description = "Only index these languages (e.g. ['lua','python']).",
+        description = "Only index these languages (e.g. ['lua','python']). Use empty array to include all detected languages.",
+        default = {},
       },
       include_docstrings = {
         type = "boolean",
-        description = "Include docstrings/comments when available (default true).",
+        description = "Include docstrings/comments when available.",
+        default = true,
       },
       include_ranges = {
         type = "boolean",
-        description = "Include 1-based line/col ranges (default true).",
+        description = "Include 1-based line/col ranges.",
+        default = true,
       },
       include_signatures = {
         type = "boolean",
-        description = "Include basic signatures when available (default true).",
+        description = "Include basic signatures when available.",
+        default = true,
       },
       max_files = {
         type = "number",
-        description = "Maximum files to process (default 50).",
+        description = "Maximum files to process (safeguard).",
+        default = 150,
       },
       max_symbols_per_file = {
         type = "number",
-        description = "Maximum symbols to collect per file (default 200).",
+        description = "Maximum symbols to collect per file (safeguard).",
+        default = 300,
       },
       fallback_to_text = {
         type = "boolean",
-        description = "Fallback to textual heuristics if Tree-sitter fails (default true).",
+        description = "Fallback to textual heuristics if Tree-sitter fails.",
+        default = true,
       },
     },
-    required = {},
+    required = {
+      "path",
+      "files",
+      "globs",
+      "languages",
+      "include_docstrings",
+      "include_ranges",
+      "include_signatures",
+      "max_files",
+      "max_symbols_per_file",
+      "fallback_to_text",
+    },
     additionalProperties = false,
   },
 }
@@ -127,7 +148,7 @@ local function node_text(node, bufnr)
   -- Only attempt range() if present and callable
   local sr, sc, er, ec
   local okr = false
-  if (type(node) == "userdata" or type(node) == "table") then
+  if type(node) == "userdata" or type(node) == "table" then
     local r = nil
     -- Prefer direct field; fall back to metatable __index if needed
     if type(node.range) == "function" then
@@ -163,7 +184,7 @@ local function make_range(node)
   -- Only attempt range() if present and callable
   local sr, sc, er, ec
   local okr = false
-  if (type(node) == "userdata" or type(node) == "table") then
+  if type(node) == "userdata" or type(node) == "table" then
     local r = nil
     if type(node.range) == "function" then
       r = node.range
@@ -433,8 +454,8 @@ local function leading_comment_block(bufnr, start_line_1, lang)
       i = i - 1
     else
       if
-          (lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go")
-          and ends_with_block_end(l)
+        (lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go")
+        and ends_with_block_end(l)
       then
         in_block = true
         block_collected = { l }
@@ -526,12 +547,12 @@ local function fallback_scan(bufnr, lang, max_symbols)
   elseif lang == "python" then
     patterns = {
       { kind = "function", pat = "^%s*def%s+([A-Za-z_][%w_]*)%s*%((.-)%)" },
-      { kind = "class",    pat = "^%s*class%s+([A-Za-z_][%w_]*)%s*%b()?:" },
+      { kind = "class", pat = "^%s*class%s+([A-Za-z_][%w_]*)%s*%b()?:" },
     }
   elseif lang == "javascript" or lang == "typescript" or lang == "tsx" then
     patterns = {
       { kind = "function", pat = "^%s*function%s+([A-Za-z_$][%w_$]*)%s*%((.-)%)" },
-      { kind = "class",    pat = "^%s*class%s+([A-Za-z_$][%w_$]*)%s*[%{%w]" },
+      { kind = "class", pat = "^%s*class%s+([A-Za-z_$][%w_$]*)%s*[%{%w]" },
     }
   elseif lang == "go" then
     patterns = {
@@ -575,7 +596,7 @@ local function extract_symbols_for_file(file_path, args)
   local include_doc = args.include_docstrings ~= false
   local include_ranges = args.include_ranges ~= false
   local include_sigs = args.include_signatures ~= false
-  local max_per_file = args.max_symbols_per_file or 200
+  local max_per_file = tonumber(args.max_symbols_per_file) or 300
 
   local parser, perr = get_parser(bufnr, lang)
   local symbols = {}
@@ -699,7 +720,9 @@ local function extract_symbols_for_file(file_path, args)
             local nt
             if n and (type(n) == "userdata" or type(n) == "table") and n.type then
               local ok_t, t = pcall(n.type, n)
-              if ok_t then nt = t end
+              if ok_t then
+                nt = t
+              end
             end
             if nt and wanted[nt] then
               return n
@@ -793,7 +816,9 @@ local function extract_symbols_for_file(file_path, args)
             local nt
             if n and (type(n) == "userdata" or type(n) == "table") and n.type then
               local ok_t, t = pcall(n.type, n)
-              if ok_t then nt = t end
+              if ok_t then
+                nt = t
+              end
             end
             if nt and want[nt] then
               return n
@@ -801,7 +826,9 @@ local function extract_symbols_for_file(file_path, args)
             local p
             if n and (type(n) == "userdata" or type(n) == "table") and n.parent then
               local ok_p, pn = pcall(n.parent, n)
-              if ok_p then p = pn end
+              if ok_p then
+                p = pn
+              end
             end
             n = p
             steps = steps + 1
@@ -894,17 +921,23 @@ local function extract_symbols_for_file(file_path, args)
 end
 
 local function gather_files(args)
+  -- Coerce files: when non-empty, use it directly
   if type(args.files) == "table" and #args.files > 0 then
     return args.files
   end
+
+  -- Otherwise use path + globs
   local path = args.path
   if type(path) ~= "string" or trim(path) == "" then
     path = "."
   else
     path = vim.fn.expand(path)
   end
+
   local cmd = { "rg", "--files", path }
-  if type(args.globs) == "table" then
+
+  -- Coerce globs: only add -g if globs array is non-empty
+  if type(args.globs) == "table" and #args.globs > 0 then
     for _, g in ipairs(args.globs) do
       if type(g) == "string" and g ~= "" then
         table.insert(cmd, "-g")
@@ -912,6 +945,7 @@ local function gather_files(args)
       end
     end
   end
+
   local result = vim.system(cmd, { cwd = vim.fn.getcwd(), text = true }):wait()
   if result.code > 1 then
     return nil, "Error running rg: " .. (result.stderr or "unknown error")
@@ -922,6 +956,8 @@ end
 
 M.run = function(args)
   args = args or {}
+
+  -- Coerce languages filter: empty array means include all
   local include_langs = {}
   if type(args.languages) == "table" and #args.languages > 0 then
     for _, l in ipairs(args.languages) do
@@ -937,7 +973,7 @@ M.run = function(args)
     return "SymbolIndex: No files to process"
   end
 
-  local max_files = args.max_files or 50
+  local max_files = tonumber(args.max_files) or 150
   local results = {}
   local fcount, scount = 0, 0
 

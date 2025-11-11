@@ -1,7 +1,7 @@
 --- @class Reader
 --- @field file_path string: The path of the file to read (relative to the current working directory)
---- @field start_line number|nil: Line number to start reading the content (default: 1)
---- @field end_line number|nil: Line number to stop reading the content (default: end of file)
+--- @field start_line number: Line number to start reading the content (use 1 for beginning)
+--- @field end_line number: Line number to stop reading the content (use -1 for end of file)
 local M = {}
 
 local utils = require("neoai.ai_tools.utils")
@@ -14,22 +14,23 @@ M.meta = {
     properties = {
       file_path = {
         type = "string",
-        description = string.format(
-          "The path of the file to read (relative to the current working directory %s)",
-          vim.fn.getcwd()
-        ),
+        description = "The path of the file to read (relative to the current working directory). Must not be empty.",
       },
       start_line = {
         type = "number",
-        description = "Line number to start reading the content (default: 1)",
+        description = "Line number to start reading the content. Use 1 for beginning of file.",
+        default = 1,
       },
       end_line = {
         type = "number",
-        description = "Line number to stop reading the content (default: end of file)",
+        description = "Line number to stop reading the content. Use -1 to read to end of file.",
+        default = -1,
       },
     },
     required = {
       "file_path",
+      "start_line",
+      "end_line",
     },
     additionalProperties = false,
   },
@@ -39,6 +40,11 @@ M.meta = {
 --- @param args Reader: Arguments for the reading process
 --- @return table<string, string>: The content and status display information
 M.run = function(args)
+  -- Validate file_path
+  if not args.file_path or type(args.file_path) ~= "string" or args.file_path == "" then
+    return { content = "Error: file_path is required and must not be empty", display = "Read: (failed - no path)" }
+  end
+
   local pwd = vim.loop.cwd() or vim.fn.getcwd()
   local abs_path = args.file_path
   if not abs_path:match("^/") and not abs_path:match("^%a:[/\\]") then
@@ -46,6 +52,7 @@ M.run = function(args)
   end
   abs_path = vim.fn.fnamemodify(abs_path, ":p")
 
+  -- Coerce start_line with default of 1
   local start_line = tonumber(args.start_line) or 1
   if start_line < 1 then
     start_line = 1
@@ -82,8 +89,12 @@ M.run = function(args)
 
   local raw_lines = vim.split(content, "\n", { plain = true })
   local total_lines = #raw_lines
-  local end_line = args.end_line and tonumber(args.end_line) or total_lines
-  if end_line == math.huge or not end_line or end_line > total_lines then
+
+  -- Coerce end_line: -1 or nil or 0 means "end of file"
+  local end_line = tonumber(args.end_line)
+  if not end_line or end_line <= 0 or end_line == math.huge then
+    end_line = total_lines
+  elseif end_line > total_lines then
     end_line = total_lines
   elseif end_line < start_line then
     end_line = start_line

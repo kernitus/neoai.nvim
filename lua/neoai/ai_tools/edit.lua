@@ -21,7 +21,7 @@ local function split_lines(str)
 end
 
 local function normalise_eol(s)
-  return (s or ""):gsub("\r\n", "\n"):gsub("\r", "")
+  return (s or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
 end
 
 local function strip_cr(lines)
@@ -191,17 +191,17 @@ M.meta = {
     properties = {
       file_path = {
         type = "string",
-        description = string.format("The path of the file to modify or create (relative to cwd %s)", vim.fn.getcwd()),
+        description = "The path of the file to modify or create (relative to current working directory). Must not be empty.",
       },
       edits = {
         type = "array",
-        description = "Array of edit operations, each containing old_string and new_string (plain text). Order is not required.",
+        description = "Array of edit operations, each containing old_string and new_string (plain text). Order is not required. Must contain at least one edit.",
         items = {
           type = "object",
           properties = {
             old_string = {
               type = "string",
-              description = "Exact text block to replace (empty string means insert at beginning of file).",
+              description = "Exact text block to replace. Use empty string to insert at beginning of file.",
             },
             new_string = {
               type = "string",
@@ -269,7 +269,12 @@ M.run = function(args)
   local rel_path = args.file_path
   local edits = args.edits
 
-  if type(rel_path) ~= "string" or type(edits) ~= "table" then
+  -- Validate required arguments
+  if type(rel_path) ~= "string" or rel_path == "" then
+    return "Edit tool error: 'file_path' is required and must not be empty."
+  end
+
+  if type(edits) ~= "table" then
     local keys = {}
     for k, _ in pairs(args) do
       table.insert(keys, tostring(k))
@@ -289,6 +294,10 @@ M.run = function(args)
       table.concat(keys, ", "),
       preview
     )
+  end
+
+  if #edits == 0 then
+    return "Edit tool error: 'edits' array must contain at least one edit operation."
   end
 
   local allowed_edit_keys = { old_string = true, new_string = true }

@@ -11,22 +11,30 @@ M.meta = {
     properties = {
       query_string = {
         type = "string",
-        description = "The search query for ripgrep.",
+        description = "The search query for ripgrep. Must not be empty.",
       },
       use_regex = {
         type = "boolean",
-        description = "When true, treat query_string as a ripgrep regex. Default: false (literal search).",
+        description = "When true, treat query_string as a ripgrep regex. When false, use literal/fixed-string search.",
+        default = false,
       },
       file_type = {
         type = "string",
-        description = "(Optional) Restrict search to files of this type (e.g., 'lua', 'ts'). Use 'all' to search all known file types. See `rg --type-list` for options.",
+        description = "Restrict search to files of this type (e.g., 'lua', 'ts'). Use 'all' to search all known file types. Use empty string for no restriction. See `rg --type-list` for options.",
+        default = "",
       },
       exclude_file_type = {
         type = "string",
-        description = "(Optional) Exclude files of this type from the search (e.g., 'md', 'json').",
+        description = "Exclude files of this type from the search (e.g., 'md', 'json'). Use empty string for no exclusion.",
+        default = "",
       },
     },
-    required = { "query_string" },
+    required = {
+      "query_string",
+      "use_regex",
+      "file_type",
+      "exclude_file_type",
+    },
     additionalProperties = false,
   },
 }
@@ -51,21 +59,35 @@ local function make_params_line(query, use_regex, file_type, exclude_file_type)
 end
 
 --- Executes the grep command with given arguments.
---- @param args table: Contains optional parameters 'query_string', 'use_regex', 'file_type', and 'exclude_file_type'.
+--- @param args table: Contains parameters 'query_string', 'use_regex', 'file_type', and 'exclude_file_type'.
 --- @return table|string: A table with `content` and `params_line`, or an error message.
 M.run = function(args)
   local query = args.query_string
-  local use_regex = args.use_regex == true
-  local file_type = (args.file_type and #args.file_type > 0) and args.file_type or nil
-  local exclude_file_type = (args.exclude_file_type and #args.exclude_file_type > 0) and args.exclude_file_type or nil
-  local params_line = make_params_line(query or "", use_regex, file_type, exclude_file_type)
 
-  if not query or #query == 0 then
+  -- Validate query_string
+  if not query or type(query) ~= "string" or #query == 0 then
     return {
-      content = "Error: 'query_string' is required.",
-      params_line = params_line,
+      content = "Error: 'query_string' is required and must not be empty.",
+      params_line = "Parameters used: query_string=(empty or invalid)",
     }
   end
+
+  -- Coerce use_regex with default of false
+  local use_regex = args.use_regex == true
+
+  -- Coerce file_type: empty string means no filter
+  local file_type = args.file_type
+  if type(file_type) ~= "string" or #file_type == 0 then
+    file_type = nil
+  end
+
+  -- Coerce exclude_file_type: empty string means no exclusion
+  local exclude_file_type = args.exclude_file_type
+  if type(exclude_file_type) ~= "string" or #exclude_file_type == 0 then
+    exclude_file_type = nil
+  end
+
+  local params_line = make_params_line(query, use_regex, file_type, exclude_file_type)
 
   -- Base ripgrep command with vimgrep-style output
   local cmd = { "rg", "--vimgrep", "--color", "never" }

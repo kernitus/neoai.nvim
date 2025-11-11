@@ -1,47 +1,154 @@
 local Job = require("plenary.job")
 local conf = require("neoai.config").get_api("main")
-local tool_schemas = require("neoai.ai_tools").tool_schemas
+local chat_tool_schemas = require("neoai.ai_tools").tool_schemas
 local log = require("neoai.debug").log
 
 local api = {}
 
 -- Track current streaming job
---- @type Job|nil  -- Current streaming job
+--- @type Job|nil
 local current_job = nil
 
 -- Single queued stream request (if a new request arrives whilst one is active)
 local queued_stream = nil
 
---- Merges two tables into a new one.
---- @param t1 table  -- The first table
---- @param t2 table  -- The second table
---- @return table  -- The merged table
+--- Merges two tables into a new one (shallow).
+--- @param t1 table
+--- @param t2 table
+--- @return table
 local function merge_tables(t1, t2)
   local result = {}
-  for k, v in pairs(t1) do
+  for k, v in pairs(t1 or {}) do
     result[k] = v
   end
-  for k, v in pairs(t2) do
+  for k, v in pairs(t2 or {}) do
     result[k] = v
   end
   return result
 end
 
---- Start streaming completion
+--- Convert Chat-style function tools into Responses API tool shape (internally-tagged).
+--- Chat-style:
+---   { type="function", ["function"]={ name, description, parameters, strict? } }
+--- Responses-style:
+---   { type="function", name, description, parameters, strict? }
+--- @param tools table
+--- @return table
+local function to_responses_tools(tools)
+  local out = {}
+  for _, t in ipairs(tools or {}) do
+    if t and t.type == "function" and t["function"] then
+      local f = t["function"]
+      table.insert(out, {
+        type = "function",
+        name = f.name,
+        description = f.description,
+        parameters = f.parameters,
+        strict = (f.strict ~= nil) and f.strict or true,
+      })
+    else
+      table.insert(out, t)
+    end
+  end
+  return out
+end
+
+--- Merge user-configured native tools (if any) into the outgoing tools list.
+--- @param base table
+--- @param native any
+--- @return table
+local function merge_native_tools(base, native)
+  if type(native) == "table" then
+    for _, t in ipairs(native) do
+      table.insert(base, t)
+    end
+  end
+  return base
+end
+
+local function is_reasoning_model(name)
+  local n = tostring(name or ""):lower()
+  if n:match("^gpt%-5") then
+    return true
+  end
+  if n:match("^o%d") or n:match("^o%-") then
+    return true
+  end
+  return false
+end
+
+--- Convert Chat-style messages to Responses Items + instructions.
+local function chat_messages_to_items(messages)
+  local items = {}
+  local instructions_parts = {}
+
+  local function add_instructions(s)
+    if s and s ~= "" then
+      table.insert(instructions_parts, s)
+    end
+  end
+
+  for _, m in ipairs(messages or {}) do
+    local role = m.role
+    local content = m.content or ""
+    if role == "system" then
+      add_instructions(content)
+    elseif role == "user" then
+      table.insert(items, {
+        type = "message",
+        role = "user",
+        content = { { type = "input_text", text = content } },
+      })
+    elseif role == "assistant" then
+      local tcs = m.tool_calls
+      if type(tcs) == "table" and #tcs > 0 then
+        for _, tc in ipairs(tcs) do
+          local fn = tc["function"] or {}
+          local args = fn.arguments
+          if type(args) ~= "string" then
+            local ok, enc = pcall(vim.fn.json_encode, args)
+            args = ok and enc or tostring(args)
+          end
+          local call_id = tc.call_id or tc.id or ("tc-" .. tostring(tc.index or 0))
+          table.insert(items, {
+            type = "function_call",
+            call_id = tostring(call_id),
+            name = fn.name or "",
+            arguments = args or "{}",
+          })
+        end
+      else
+        if content ~= "" then
+          table.insert(items, {
+            type = "message",
+            role = "assistant",
+            content = { { type = "output_text", text = content } },
+          })
+        end
+      end
+    elseif role == "tool" then
+      local call_id = m.tool_call_id or m.id or ""
+      table.insert(items, {
+        type = "function_call_output",
+        call_id = tostring(call_id),
+        output = content,
+      })
+    end
+  end
+
+  local instructions = table.concat(instructions_parts, "\n\n")
+  return items, instructions
+end
+
+--- Start streaming a Responses API generation
 --- @param messages table
 --- @param on_chunk fun(chunk: table)
 --- @param on_complete fun()
 --- @param on_error fun(err: integer|string)
 --- @param on_cancel fun()|nil
 function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
-  log(
-    "api.stream: start | messages=%d tools=%d model=%s",
-    #(messages or {}),
-    #(tool_schemas or {}),
-    tostring(conf.model)
-  )
+  log("api.stream: start (Responses) | messages=%d model=%s", #(messages or {}), tostring(conf.model))
 
-  -- If a stream is already active, queue this request and start it when the current job exits.
   if current_job ~= nil then
     log("api.stream: busy; queuing next stream request")
     queued_stream = {
@@ -54,188 +161,140 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     return
   end
 
-  -- Track if we've already reported an error to avoid duplicate notifications
   local error_reported = false
-  -- Buffer non-SSE stdout to recover JSON error bodies when the server does not stream
   local non_sse_buf = {}
-  local http_status -- captured from curl --write-out
+  local http_status
   local saw_any_chunk = false
-
-  -- Track stream completion and sentinel
   local completed = false
   local done_seen = false
 
+  local tools = to_responses_tools(chat_tool_schemas)
+  tools = merge_native_tools(tools, conf.native_tools)
+
+  local items, instructions = chat_messages_to_items(messages)
+
   local basic_payload = {
     model = conf.model,
-    max_completion_tokens = conf.max_completion_tokens,
+    input = items,
     stream = true,
-    messages = messages,
-    tools = tool_schemas,
+    tools = tools,
+    max_output_tokens = conf.max_output_tokens,
+    store = false,
   }
+  if instructions and instructions ~= "" then
+    basic_payload.instructions = instructions
+  end
 
-  local payload = vim.fn.json_encode(merge_tables(basic_payload, conf.additional_kwargs or {}))
+  local payload_tbl = merge_tables(basic_payload, conf.additional_kwargs or {})
+  payload_tbl.store = false
+  payload_tbl.previous_response_id = nil
+  payload_tbl.conversation = nil
+  payload_tbl.thread_id = nil
+
+  if is_reasoning_model(conf.model) then
+    payload_tbl.reasoning = payload_tbl.reasoning or {}
+    if payload_tbl.reasoning.summary == nil then
+      payload_tbl.reasoning.summary = "auto"
+    end
+  else
+    payload_tbl.reasoning = nil
+  end
+
+  local payload = vim.fn.json_encode(payload_tbl)
 
   if conf.debug_payload then
-    vim.notify("NeoAI: Sending JSON payload to curl (stream):\n" .. payload, vim.log.levels.DEBUG, { title = "NeoAI" })
+    vim.notify(
+      "NeoAI: Sending JSON payload to curl (Responses stream):\n" .. payload,
+      vim.log.levels.DEBUG,
+      { title = "NeoAI" }
+    )
   end
 
   local raw_body_chunks = {}
 
-  -- Accumulate streamed tool_call arguments across deltas and flush on finish
-  local tool_call_acc = {} -- key (id or idx_*) -> schema
-  local tool_call_order = {} -- stable first-seen order
-  local index_to_key = {} -- index -> current authoritative key (for re-routing after merge)
+  -- Function-call accumulator keyed by call_id (Responses itemised events)
+  local fc_acc = {} -- call_id -> { name, args, index }
+  local active_call_id = nil -- current function_call item id for deltas that omit call_id
 
-  local function acc_tool_calls(calls)
-    for _, tc in ipairs(calls or {}) do
-      local f = tc["function"] or {}
-      local real_id = tc.id
-      local idx = tc.index
-
-      -- Determine the authoritative key for this index
-      local key
-      if idx ~= nil and index_to_key[idx] then
-        -- We already have a key for this index (either idx_* or real_id from a previous delta)
-        key = index_to_key[idx]
-      elseif real_id and real_id ~= "" then
-        -- First time seeing this index with a real id
-        key = real_id
-        if idx ~= nil then
-          index_to_key[idx] = real_id
-        end
-      else
-        -- First time seeing this index, no real id yet
-        key = "idx_" .. tostring(idx or (#tool_call_order + 1))
-        if idx ~= nil then
-          index_to_key[idx] = key
-        end
-      end
-
-      -- If we just learned the real_id for an index that was previously idx_*, migrate the entry
-      if real_id and real_id ~= "" and idx ~= nil then
-        local old_key = "idx_" .. tostring(idx)
-        if old_key ~= key and tool_call_acc[old_key] then
-          -- Migrate idx_* entry to real_id
-          local stub = tool_call_acc[old_key]
-          tool_call_acc[old_key] = nil
-
-          if not tool_call_acc[key] then
-            tool_call_acc[key] = {
-              id = real_id,
-              index = stub.index or idx,
-              type = "function",
-              ["function"] = {
-                name = (f.name and f.name ~= "" and f.name) or (stub["function"] and stub["function"].name) or "",
-                arguments = (stub["function"] and stub["function"].arguments) or "",
-              },
-            }
-          else
-            -- Merge arguments if both exist
-            local early = (stub["function"] and stub["function"].arguments) or ""
-            local existing = (tool_call_acc[key]["function"] and tool_call_acc[key]["function"].arguments) or ""
-            tool_call_acc[key]["function"].arguments = early .. existing
-            if (tool_call_acc[key]["function"].name or "") == "" then
-              tool_call_acc[key]["function"].name = (f.name and f.name ~= "" and f.name)
-                or (stub["function"] and stub["function"].name)
-                or ""
-            end
-          end
-
-          -- Update order list
-          for i, k in ipairs(tool_call_order) do
-            if k == old_key then
-              tool_call_order[i] = key
-              break
-            end
-          end
-
-          -- Update mapping
-          index_to_key[idx] = key
-        end
-      end
-
-      -- Ensure entry exists
-      if not tool_call_acc[key] then
-        tool_call_acc[key] = {
-          id = real_id or key,
-          index = idx,
-          type = "function",
-          ["function"] = { name = f.name or "", arguments = "" },
-        }
-        table.insert(tool_call_order, key)
-      end
-
-      -- Update name (prefer non-empty)
-      if f.name and f.name ~= "" then
-        tool_call_acc[key]["function"].name = f.name
-      end
-
-      -- Append streamed arguments
-      if f.arguments and f.arguments ~= "" then
-        local prev = tool_call_acc[key]["function"].arguments or ""
-        tool_call_acc[key]["function"].arguments = prev .. f.arguments
-
-        -- Log accumulation for large tool calls
-        local total = #tool_call_acc[key]["function"].arguments
-        if total > 30000 then
-          log(
-            "acc_tool_calls: id=%s name=%s total_bytes=%d delta_bytes=%d",
-            tostring(key),
-            tostring(tool_call_acc[key]["function"].name),
-            total,
-            #f.arguments
-          )
-        end
-      end
+  local function fc_ensure(id)
+    if not id or id == "" then
+      return nil
     end
+    local rec = fc_acc[id]
+    if not rec then
+      rec = { name = "", args = "", index = nil }
+      fc_acc[id] = rec
+    end
+    return rec
   end
 
-  local function flush_tool_calls()
-    if #tool_call_order == 0 then
-      return {}
+  local function fc_flush_one(id)
+    local rec = id and fc_acc[id] or nil
+    if not rec then
+      return false
     end
-
-    -- Log final sizes before flushing
-    for _, id in ipairs(tool_call_order) do
-      local tc = tool_call_acc[id]
-      local args_len = tc and tc["function"] and #(tc["function"].arguments or "") or 0
-      if args_len > 0 then
-        log(
-          "flush_tool_calls: id=%s name=%s final_args_bytes=%d",
-          tostring(id),
-          tostring(tc and tc["function"] and tc["function"].name),
-          args_len
-        )
-      end
+    local call = {
+      id = id,
+      index = rec.index,
+      type = "function",
+      ["function"] = {
+        name = rec.name or "",
+        arguments = rec.args or "",
+      },
+    }
+    on_chunk({ type = "tool_calls", data = { call }, complete = true })
+    fc_acc[id] = nil
+    if active_call_id == id then
+      active_call_id = nil
     end
+    return true
+  end
 
-    table.sort(tool_call_order, function(a, b)
-      local ia = tool_call_acc[a] and tool_call_acc[a].index or math.huge
-      local ib = tool_call_acc[b] and tool_call_acc[b].index or math.huge
-      if ia == ib then
-        return tostring(a) < tostring(b)
-      end
-      return ia < ib
-    end)
+  local function fc_flush_all()
     local out = {}
-    for _, id in ipairs(tool_call_order) do
-      table.insert(out, tool_call_acc[id])
+    for id, rec in pairs(fc_acc) do
+      table.insert(out, {
+        id = id,
+        index = rec.index,
+        type = "function",
+        ["function"] = { name = rec.name or "", arguments = rec.args or "" },
+      })
     end
-    tool_call_acc = {}
-    tool_call_order = {}
-    index_to_key = {} -- Clear mapping
-    return out
-  end
-
-  local function flush_pending_tool_calls()
-    if next(tool_call_acc) ~= nil then
-      local assembled = flush_tool_calls()
-      if #assembled > 0 then
-        on_chunk({ type = "tool_calls", data = assembled, complete = true })
-        return true
-      end
+    if #out > 0 then
+      on_chunk({ type = "tool_calls", data = out, complete = true })
+      fc_acc = {}
+      active_call_id = nil
+      return true
     end
     return false
+  end
+
+  -- Back-compat typed tool/function-call streams (single or batched deltas)
+  local function acc_tool_calls_typed(calls)
+    for _, tc in ipairs(calls or {}) do
+      local f = tc["function"] or {}
+      local id = tc.call_id or tc.id
+      if id and id ~= "" then
+        local rec = fc_ensure(id)
+        if not rec then
+          goto continue
+        end
+        if f.name and f.name ~= "" then
+          rec.name = f.name
+        elseif tc.name and tc.name ~= "" then
+          rec.name = tc.name
+        end
+        local delta = f.arguments or tc.arguments or tc.arguments_delta
+        if delta and delta ~= "" then
+          rec.args = (rec.args or "") .. delta
+        end
+        if tc.index ~= nil then
+          rec.index = rec.index or tc.index
+        end
+        active_call_id = active_call_id or id
+      end
+      ::continue::
+    end
   end
 
   local function mark_complete(reason)
@@ -254,7 +313,10 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
   local api_key_value = string.format(api_key_format, conf.api_key)
   local api_key = api_key_header .. ": " .. api_key_value
 
-  log("api.stream: spawning curl | url=%s", tostring(conf.url))
+  local url = conf.url or "https://api.openai.com/v1/responses"
+  url = url:gsub("/v1/chat/completions", "/v1/responses")
+
+  log("api.stream: spawning curl | url=%s", tostring(url))
   current_job = Job:new({
     command = "curl",
     args = {
@@ -262,7 +324,7 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
       "--show-error",
       "--no-buffer",
       "--location",
-      conf.url,
+      url,
       "--header",
       "Content-Type: application/json",
       "--header",
@@ -275,17 +337,16 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     writer = payload,
     on_stdout = function(_, line)
       for _, data_line in ipairs(vim.split(line, "\n")) do
-        -- Accept "data:" with or without a trailing space
         if data_line:sub(1, 5) == "data:" then
           local chunk = vim.trim(data_line:sub(6))
           saw_any_chunk = true
           vim.schedule(function()
             if chunk == "[DONE]" then
-              done_seen = true
-              -- Flush any final tool_calls before completing
+              -- Final chance to flush any function calls
               if not error_reported then
-                flush_pending_tool_calls()
+                fc_flush_all()
               end
+              done_seen = true
               log("api.stream: SSE [DONE] -> on_complete()")
               mark_complete("SSE_DONE")
               return
@@ -302,7 +363,7 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 err_msg = decoded.error.message or decoded.error.type or vim.inspect(decoded.error)
               elseif decoded.error ~= nil then
                 err_msg = tostring(decoded.error)
-              elseif decoded.message and not decoded.choices and not decoded.delta then
+              elseif decoded.message and not decoded.output and not decoded.delta then
                 err_msg = decoded.message
               end
               if err_msg and err_msg ~= "" then
@@ -320,18 +381,28 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
               end
             end
 
-            local handled = false
-
             if decoded.type and type(decoded.type) == "string" then
-              log("api.stream: sse.type=%s", tostring(decoded.type))
               local t = decoded.type
+              log("api.stream: sse.type=%s", tostring(t))
+
+              -- Reasoning deltas
               if (t == "response.reasoning_text.delta" or t == "response.reasoning.delta") and decoded.delta then
                 on_chunk({ type = "reasoning", data = decoded.delta })
-                handled = true
-              elseif t == "response.reasoning_text.done" or t == "response.reasoning.done" then
-                handled = true
               end
 
+              -- Reasoning summary deltas
+              if
+                t == "response.reasoning_summary.delta"
+                or t == "response.reasoning.summary.delta"
+                or t == "response.reasoning_summary_text.delta"
+              then
+                local summary = decoded.delta or decoded.text
+                if summary and summary ~= "" then
+                  on_chunk({ type = "reasoning_summary", data = summary })
+                end
+              end
+
+              -- Content deltas
               if
                 t == "response.output_text.delta"
                 or t == "response.text.delta"
@@ -343,98 +414,124 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 if text and text ~= "" then
                   on_chunk({ type = "content", data = text })
                 end
-                handled = true
               elseif t == "response.output_text.done" or t == "response.text.done" then
                 local text = decoded.text
                 if text and text ~= "" then
                   on_chunk({ type = "content", data = text })
                 end
-                handled = true
               end
 
-              -- Optional: typed tool_call streaming support
+              -- New Responses item: function_call item begins
+              if t == "response.output_item.added" and decoded.item then
+                local it = decoded.item
+                if it.type == "function_call" then
+                  local cid = it.call_id or it.id or it.output_item_id
+                  local fname = it.name or (it["function"] and it["function"].name)
+                  local idx = it.index
+                  if cid and cid ~= "" then
+                    local rec = fc_ensure(cid)
+                    if rec then
+                      if fname and fname ~= "" then
+                        rec.name = fname
+                      end
+                      rec.index = rec.index or idx
+                      active_call_id = cid
+                    end
+                  end
+                end
+              end
+
+              -- New Responses item: function_call arguments deltas
+              if t == "response.function_call_arguments.delta" then
+                local cid = decoded.call_id or decoded.id or decoded.output_item_id or active_call_id
+                local idx = decoded.index
+                local d = ""
+                if type(decoded.delta) == "string" then
+                  d = decoded.delta
+                elseif type(decoded.delta) == "table" then
+                  d = decoded.delta.arguments or decoded.delta.text or ""
+                elseif type(decoded.arguments) == "string" then
+                  d = decoded.arguments
+                elseif type(decoded.text) == "string" then
+                  d = decoded.text
+                end
+                if cid and cid ~= "" and d ~= "" then
+                  local rec = fc_ensure(cid)
+                  if rec then
+                    rec.args = (rec.args or "") .. d
+                    if idx ~= nil then
+                      rec.index = rec.index or idx
+                    end
+                    active_call_id = cid
+                  end
+                end
+              elseif t == "response.function_call_arguments.done" then
+                -- Prefer to flush the active call, fall back to flushing all if unknown
+                local flushed = false
+                if active_call_id then
+                  flushed = fc_flush_one(active_call_id)
+                end
+                if not flushed then
+                  fc_flush_all()
+                end
+              end
+
+              -- Back-compat typed function/tool call events
               if
-                t == "response.tool_call.delta"
+                t == "response.function_call.delta"
+                or t == "message.function_call.delta"
+                or t == "response.function_calls.delta"
+                or t == "response.tool_call.delta"
                 or t == "message.tool_call.delta"
                 or t == "response.tool_calls.delta"
               then
-                local calls = decoded.delta and decoded.delta.tool_calls
+                local calls = nil
+                if decoded.delta and decoded.delta.tool_calls then
+                  calls = decoded.delta.tool_calls
+                end
                 if
                   not calls
                   and decoded.delta
-                  and (decoded.delta["function"] or decoded.delta.id or decoded.delta.index)
+                  and (decoded.delta.name or decoded.delta.arguments or decoded.delta.call_id)
                 then
-                  calls = { decoded.delta }
+                  local d = decoded.delta
+                  calls = {
+                    {
+                      call_id = d.call_id,
+                      id = d.id,
+                      index = d.index,
+                      ["function"] = {
+                        name = d.name or (d["function"] and d["function"].name),
+                        arguments = d.arguments or (d["function"] and d["function"].arguments) or d.arguments_delta,
+                      },
+                    },
+                  }
                 end
                 if not calls and decoded.tool_calls then
                   calls = decoded.tool_calls
                 end
                 if calls then
-                  acc_tool_calls(calls)
+                  acc_tool_calls_typed(calls)
                 end
-                handled = true
-              elseif t == "response.tool_call.completed" or t == "message.tool_call.completed" then
-                local flushed = flush_pending_tool_calls()
-                if flushed then
-                  log("api.stream: typed tool_call.completed -> flushed")
+              end
+
+              -- Item completion for function_call
+              if t == "response.output_item.done" and decoded.item then
+                local it = decoded.item
+                if it.type == "function_call" then
+                  -- Try to flush the specific id if present on the item, else flush active/all
+                  local cid = it.call_id or it.id or it.output_item_id or active_call_id
+                  if not (cid and fc_flush_one(cid)) then
+                    fc_flush_all()
+                  end
                 end
-                handled = true
-              elseif t == "response.completed" or t == "response.done" then
-                -- Defensive: flush any pending tool_calls before completing
-                if not error_reported then
-                  flush_pending_tool_calls()
-                end
+              end
+
+              -- Final completion
+              if t == "response.completed" or t == "response.done" then
+                fc_flush_all()
                 log("api.stream: response.completed -> on_complete()")
                 mark_complete("typed_completed")
-                handled = true
-              end
-            end
-
-            if not handled then
-              local choice = decoded.choices and decoded.choices[1]
-              if choice then
-                local delta = choice.delta or {}
-                local content = delta and delta.content
-                local tool_calls = delta and delta.tool_calls
-                local reasons = delta and delta.reasoning
-
-                if reasons and reasons ~= vim.NIL and reasons ~= "" then
-                  on_chunk({ type = "reasoning", data = reasons })
-                end
-                if content and content ~= vim.NIL and content ~= "" then
-                  on_chunk({ type = "content", data = content })
-                end
-                if tool_calls then
-                  acc_tool_calls(tool_calls)
-                end
-
-                local finished_reason = choice.finish_reason
-                if finished_reason == "stop" then
-                  log("api.stream: on_complete() via finish_reason=stop")
-                  mark_complete("finish_reason_stop")
-                elseif finished_reason == "tool_calls" then
-                  -- Flush accumulated tool calls immediately
-                  if not error_reported then
-                    flush_pending_tool_calls()
-                  end
-                  log("api.stream: finish_reason=tool_calls -> early complete + cancel SSE")
-                  -- Complete now so the tool runner can start
-                  mark_complete("finish_reason_tool_calls")
-
-                  -- Proactively end the current SSE so queued streams can start
-                  vim.schedule(function()
-                    if current_job then
-                      current_job._neoai_cancelled = true
-                      pcall(function()
-                        current_job:kill(15)
-                      end)
-                      pcall(function()
-                        current_job:shutdown()
-                      end)
-                    end
-                  end)
-                  return
-                end
               end
             end
           end)
@@ -460,7 +557,7 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                     err_msg = decoded.error.message or decoded.error.type or vim.inspect(decoded.error)
                   elseif decoded.error ~= nil then
                     err_msg = tostring(decoded.error)
-                  elseif type(decoded) == "table" and decoded.message and not decoded.choices then
+                  elseif type(decoded) == "table" and decoded.message and not decoded.output then
                     err_msg = decoded.message
                   end
                   if err_msg and err_msg ~= "" then
@@ -513,7 +610,6 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
         if current_job == j then
           current_job = nil
 
-          -- Handle curl process exit statuses and HTTP errors first
           if j._neoai_cancelled then
             if on_cancel then
               on_cancel()
@@ -538,18 +634,16 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
             end
           end
 
-          -- Fallback: if stream ended without [DONE]/typed completed but we did receive chunks,
-          -- flush pending tool_calls and complete once.
+          -- Fallback: flush any pending calls if we received chunks but did not complete properly
           if not j._neoai_cancelled and not error_reported and saw_any_chunk and not completed then
-            local flushed = flush_pending_tool_calls()
+            local flushed = fc_flush_all()
             if flushed then
-              log("api.stream: on_exit fallback -> flushed pending tool_calls")
+              log("api.stream: on_exit fallback -> flushed pending function calls")
             end
-            -- Even if nothing to flush, mark complete so the UI/runner can progress.
             mark_complete("on_exit_without_DONE")
           end
 
-          -- If a next stream was queued whilst this one was active, start it now.
+          -- Start queued request if any
           if queued_stream then
             local q = queued_stream
             queued_stream = nil

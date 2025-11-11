@@ -972,6 +972,18 @@ function chat.send_to_ai()
     start_thinking_animation()
   end
 
+  -- One-shot action turn: force a user prompt so the model responds with tool calls.
+  if chat.chat_state._nudge_next_turn then
+    table.insert(messages, {
+      role = "user",
+      content = [[Do not restate a plan. Execute the next step now by calling tools only.
+- Use Read with {"file_path":"<path>","start_line":1,"end_line":-1} to open files mentioned.
+- Use SymbolIndex / TreeSitterQuery / LspDiagnostic / LspCodeAction as needed (all required fields must be provided).
+Return only function calls (no prose) until you have tool results.]],
+    })
+    chat.chat_state._nudge_next_turn = false
+  end
+
   log("chat.send_to_ai: call api.stream | payload_messages=%d", #messages)
   chat.stream_ai_response(messages)
 end
@@ -1027,6 +1039,7 @@ function chat.stream_ai_response(messages)
   end
 
   local reason, content, tool_calls_response = "", "", {}
+  local reasoning_summary = "" -- Accumulate streamed reasoning summary
   log("stream_ai_response: init state")
   local start_time = os.time()
   local saw_first_token = false
@@ -1125,76 +1138,48 @@ function chat.stream_ai_response(messages)
 
     if chunk.type == "content" and chunk.data ~= "" then
       content = tostring(content) .. chunk.data
-      chat.update_streaming_message(reason, tostring(content or ""), false)
+      chat.update_streaming_message(reason, tostring(content or ""), false, reasoning_summary)
     elseif chunk.type == "reasoning" and chunk.data ~= "" then
       reason = reason .. chunk.data
-      chat.update_streaming_message(reason, tostring(content), false)
+      chat.update_streaming_message(reason, tostring(content), false, reasoning_summary)
+    elseif chunk.type == "reasoning_summary" and chunk.data ~= "" then
+      reasoning_summary = reasoning_summary .. chunk.data
+      chat.update_streaming_message(reason, tostring(content), false, reasoning_summary)
     elseif chunk.type == "tool_calls" then
-      local n = (chunk.data and #chunk.data) or 0
+      local calls = type(chunk.data) == "table" and chunk.data or {}
+      local n = #calls
       local ids = {}
-      for _, tc in ipairs(chunk.data or {}) do
-        table.insert(ids, tostring(tc.id or ("<nil>#" .. tostring(tc.index))))
+      for _, tc in ipairs(calls) do
+        table.insert(ids, tostring(tc.id or tc.call_id or ("<noid>#" .. tostring(tc.index or -1))))
       end
       log("stream_ai_response: chunk tool_calls | n=%d ids=%s", n, table.concat(ids, ","))
 
-      if chunk.data and type(chunk.data) == "table" then
-        local stamp = tostring(os.time())
-        for _, tool_call in ipairs(chunk.data) do
-          if tool_call and tool_call.index ~= nil then
-            local found = false
-            for _, existing_call in ipairs(tool_calls_response) do
-              if existing_call.index == tool_call.index then
-                if tool_call["function"] then
-                  existing_call["function"] = existing_call["function"] or {}
-                  if tool_call["function"].name and tool_call["function"].name ~= "" then
-                    existing_call["function"].name = tool_call["function"].name
-                  end
-                  if tool_call["function"].arguments and tool_call["function"].arguments ~= "" then
-                    existing_call["function"].arguments = (existing_call["function"].arguments or "")
-                      .. tool_call["function"].arguments
-                  end
-                end
-                if not existing_call.id or existing_call.id == "" then
-                  local tcid = tool_call.id
-                  if not tcid or tcid == "" then
-                    tcid = string.format("tc-%s-%d", stamp, tool_call.index or 0)
-                  end
-                  existing_call.id = tcid
-                end
-                found = true
-                break
-              end
-            end
-            if not found then
-              local tcid = tool_call.id
-              if not tcid or tcid == "" then
-                tcid = string.format("tc-%s-%d", stamp, tool_call.index or 0)
-              end
-              local complete_tool_call = {
-                index = tool_call.index,
-                id = tcid,
-                type = tool_call.type or "function",
-                ["function"] = {
-                  name = tool_call["function"] and tool_call["function"].name or "",
-                  arguments = tool_call["function"] and tool_call["function"].arguments or "",
-                },
-              }
-              table.insert(tool_calls_response, complete_tool_call)
-            end
+      -- Normalise into our local tool_calls_response without requiring .index
+      tool_calls_response = {}
+      local stamp = tostring(os.time())
+      for _, tc in ipairs(calls) do
+        local id = tc.id or tc.call_id
+        if not id or id == "" then
+          if tc.index ~= nil then
+            id = string.format("idx_%d", tc.index)
+          else
+            id = "tc-" .. stamp
           end
         end
-        local assembled = {}
-        for _, tc in ipairs(tool_calls_response) do
-          table.insert(assembled, tostring(tc.id or ("<nil>#" .. tostring(tc.index))))
-        end
-        log(
-          "stream_ai_response: assembled tool_calls_response | n=%d ids=%s",
-          #tool_calls_response,
-          table.concat(assembled, ",")
-        )
-        local prep_status = render_tool_prep_status()
-        chat.update_streaming_message(prep_status, tostring(content or ""), false)
+        local fn_name = (tc["function"] and tc["function"].name) or tc.name or ""
+        local fn_args = (tc["function"] and tc["function"].arguments) or tc.arguments or ""
+
+        table.insert(tool_calls_response, {
+          id = id,
+          index = tc.index, -- may be nil
+          type = "function",
+          ["function"] = { name = fn_name, arguments = fn_args or "" },
+        })
       end
+
+      -- Show preparation status (sizes), then keep streaming content as usual
+      local prep_status = render_tool_prep_status()
+      chat.update_streaming_message(prep_status, tostring(content or ""), false, reasoning_summary)
     end
   end, function()
     if has_completed then
@@ -1217,7 +1202,12 @@ function chat.stream_ai_response(messages)
 
     -- Persist any streamed assistant content before handling tool calls, so it remains visible in the chat.
     if content ~= "" then
-      chat.add_message(MESSAGE_TYPES.ASSISTANT, content, { response_time = os.time() - start_time })
+      local meta = { response_time = os.time() - start_time }
+      if reasoning_summary ~= "" then
+        meta.reasoning_summary = reasoning_summary
+        meta.display = "Reasoning summary:\n" .. reasoning_summary .. "\n\n" .. content
+      end
+      chat.add_message(MESSAGE_TYPES.ASSISTANT, content, meta)
     end
     update_chat_display()
 
@@ -1234,9 +1224,26 @@ function chat.stream_ai_response(messages)
       -- No more tools; end of turn.
       chat.chat_state.streaming_active = false
 
-      local silent = (content or "") == ""
+      local content_txt = tostring(content or "")
+      local silent = (content_txt == "")
       local now = os.time()
       local recent_tool = chat.chat_state._last_tool_turn_ts > 0 and ((now - chat.chat_state._last_tool_turn_ts) <= 180)
+
+      -- Detect plan-without-action cues even when no recent tool turn
+      local plan_cue = false
+      do
+        -- Tweak phrases here as you see them in the wild
+        if
+          content_txt:match("[Pp]roceeding")
+          or content_txt:match("[Ww]ill%s+read")
+          or content_txt:match("[Rr]eading")
+          or content_txt:match("[Ii]nspecting")
+          or content_txt:match("[Ww]ill%s+apply")
+          or content_txt:match("[Ww]ill%s+implement")
+        then
+          plan_cue = true
+        end
+      end
 
       local should_resume = false
       local resume_reason = ""
@@ -1250,12 +1257,7 @@ function chat.stream_ai_response(messages)
           else
             log("chat: max silent retries (5) reached")
           end
-        elseif
-          content:match("[Pp]roceeding")
-          or content:match("[Ww]ill read")
-          or content:match("[Ww]ill implement")
-          or content:match("[Ww]ill apply")
-        then
+        elseif plan_cue then
           chat.chat_state._plan_without_action_count = (chat.chat_state._plan_without_action_count or 0) + 1
           if chat.chat_state._plan_without_action_count <= 3 then
             should_resume = true
@@ -1263,16 +1265,60 @@ function chat.stream_ai_response(messages)
           else
             log("chat: max plan-without-action retries (3) reached")
           end
+        else
+          -- Reset counters if the assistant actually responded substantively
+          chat.chat_state._consecutive_silent_turns = 0
+          chat.chat_state._plan_without_action_count = 0
         end
       else
-        chat.chat_state._consecutive_silent_turns = 0
-        chat.chat_state._plan_without_action_count = 0
+        -- New: also resume on plan cues even when there was no recent tool turn
+        if plan_cue then
+          chat.chat_state._plan_without_action_count = (chat.chat_state._plan_without_action_count or 0) + 1
+          if chat.chat_state._plan_without_action_count <= 2 then
+            should_resume = true
+            resume_reason = "plan-cue without recent tools"
+          else
+            log("chat: plan-cue retries exceeded (2) without recent tools")
+          end
+        else
+          chat.chat_state._consecutive_silent_turns = 0
+          chat.chat_state._plan_without_action_count = 0
+        end
       end
 
       if should_resume then
-        log("chat: auto-resume after %s", resume_reason)
+        -- Persist a snapshot of what we streamed so far so it does not vanish on resume.
+        local content_txt = tostring(content or "")
+        local meta = { response_time = os.time() - start_time, partial = true }
+        local display_parts = {}
+
+        if reason and reason ~= "" then
+          table.insert(display_parts, "Reasoning:\n" .. reason)
+        end
+        if content_txt ~= "" then
+          table.insert(display_parts, content_txt)
+        else
+          table.insert(display_parts, "(plan)")
+        end
+        if reasoning_summary and reasoning_summary ~= "" then
+          table.insert(display_parts, "Reasoning summary:\n" .. reasoning_summary)
+          meta.reasoning_summary = reasoning_summary
+        end
+
+        local display = table.concat(display_parts, "\n\n")
+        meta.display = display
+
+        chat.add_message(MESSAGE_TYPES.ASSISTANT, content_txt ~= "" and content_txt or "(plan)", meta)
+        update_chat_display()
+
+        -- Arm a one-shot nudge so the very next turn emits tool calls instead of restating plans.
+        chat.chat_state._nudge_next_turn = true
+
+        log("chat: auto-resume (persisted partial + nudge) after %s", resume_reason)
         vim.schedule(function()
-          chat.send_to_ai()
+          if not chat.chat_state.streaming_active and not input_has_text() then
+            chat.send_to_ai()
+          end
         end)
         return
       end
@@ -1328,7 +1374,8 @@ end
 ---@param reason string | nil
 ---@param content string | nil
 ---@param append boolean
-function chat.update_streaming_message(reason, content, append)
+---@param summary string | nil
+function chat.update_streaming_message(reason, content, append, summary)
   if not chat.chat_state.is_open or not chat.chat_state.streaming_active then
     return
   end
@@ -1358,6 +1405,15 @@ function chat.update_streaming_message(reason, content, append)
   if content and content ~= "" then
     display = display .. tostring(content)
   end
+
+  -- Stream reasoning summary below content when available
+  if summary and summary ~= "" then
+    if display ~= "" then
+      display = display .. "\n\n"
+    end
+    display = display .. "Reasoning summary:\n" .. summary
+  end
+
   if prep_status and prep_status ~= "" then
     if display ~= "" then
       display = display .. "\n\n" .. prep_status
@@ -1392,7 +1448,8 @@ end
 ---@param reason string | nil
 ---@param content string | nil
 ---@param extra string | nil
-function chat.append_to_streaming_message(reason, content, extra)
+---@param summary string | nil
+function chat.append_to_streaming_message(reason, content, extra, summary)
   if not chat.chat_state.is_open or not chat.chat_state.streaming_active then
     return
   end
@@ -1403,7 +1460,7 @@ function chat.append_to_streaming_message(reason, content, extra)
     end
     final_content = final_content .. extra
   end
-  chat.update_streaming_message(reason, final_content, true)
+  chat.update_streaming_message(reason, final_content, true, summary)
 end
 
 -- Allow cancelling current stream

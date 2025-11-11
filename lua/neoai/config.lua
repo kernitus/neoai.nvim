@@ -5,10 +5,11 @@
 ---@field url string
 ---@field api_key string
 ---@field model string
----@field max_completion_tokens number|nil
+---@field max_output_tokens number|nil
 ---@field api_key_header string|nil
 ---@field api_key_format string|nil
 ---@field additional_kwargs? table<string, any>
+---@field native_tools? table[]  -- e.g. { { type = "web_search" }, { type = "file_search" } }
 
 ---@class APISet
 ---@field main APIConfig
@@ -71,13 +72,14 @@ config.defaults = {
   -- API settings (two labelled models are required)
   api = {
     main = {
-      url = "your-api-url-here",
+      url = "your-api-url-here", -- Use a Responses API endpoint, e.g. https://api.openai.com/v1/responses
       api_key = os.getenv("AI_API_KEY") or "<your api key>", -- Support environment variables
       api_key_header = "Authorization", -- Default header
       api_key_format = "Bearer %s", -- Default format
       model = "your-main-model-here",
-      max_completion_tokens = 4096,
+      max_output_tokens = 4096,
       api_call_delay = 0,
+      native_tools = {}, -- e.g. { { type = "web_search" } }
     },
     small = {
       url = "your-api-url-here",
@@ -85,8 +87,9 @@ config.defaults = {
       api_key_header = "Authorization",
       api_key_format = "Bearer %s",
       model = "your-small-model-here",
-      max_completion_tokens = 4096,
+      max_output_tokens = 4096,
       api_call_delay = 0,
+      native_tools = {},
     },
   },
 
@@ -147,14 +150,16 @@ config.defaults = {
     groq = {
       api = {
         main = {
-          url = "https://api.groq.com/openai/v1/chat/completions",
+          url = "https://api.groq.com/openai/v1/responses",
           api_key = os.getenv("GROQ_API_KEY") or "<your api key>",
           model = "deepseek-r1-distill-llama-70b",
+          max_output_tokens = 4096,
         },
         small = {
-          url = "https://api.groq.com/openai/v1/chat/completions",
+          url = "https://api.groq.com/openai/v1/responses",
           api_key = os.getenv("GROQ_API_KEY") or "<your api key>",
           model = "llama-3.1-8b-instant", -- example small
+          max_output_tokens = 4096,
         },
       },
     },
@@ -162,20 +167,20 @@ config.defaults = {
     openai = {
       api = {
         main = {
-          url = "https://api.openai.com/v1/chat/completions",
+          url = "https://api.openai.com/v1/responses",
           api_key = os.getenv("OPENAI_API_KEY"),
           model = "gpt-5",
-          max_completion_tokens = 128000,
+          max_output_tokens = 128000,
           additional_kwargs = {
             temperature = 1,
             reasoning_effort = "medium",
           },
         },
         small = {
-          url = "https://api.openai.com/v1/chat/completions",
+          url = "https://api.openai.com/v1/responses",
           api_key = os.getenv("OPENAI_API_KEY"),
           model = "gpt-5-mini",
-          max_completion_tokens = 128000,
+          max_output_tokens = 128000,
           additional_kwargs = {
             temperature = 1,
             reasoning_effort = "minimal",
@@ -184,37 +189,20 @@ config.defaults = {
       },
     },
 
-    anthropic = {
-      api = {
-        main = {
-          url = "https://api.anthropic.com/v1/messages",
-          api_key = os.getenv("ANTHROPIC_API_KEY") or "<your api key>",
-          api_key_header = "x-api-key",
-          api_key_format = "%s",
-          model = "claude-3-5-sonnet-20241022",
-        },
-        small = {
-          url = "https://api.anthropic.com/v1/messages",
-          api_key = os.getenv("ANTHROPIC_API_KEY") or "<your api key>",
-          api_key_header = "x-api-key",
-          api_key_format = "%s",
-          model = "claude-3-5-haiku-20241022",
-        },
-      },
-    },
-
-    -- Local models
+    -- Local models (ensure your local gateway supports the Responses API)
     ollama = {
       api = {
         main = {
-          url = "http://localhost:11434/v1/chat/completions",
+          url = "http://localhost:11434/v1/responses",
           api_key = "", -- No API key needed for local
           model = "llama3.1:70b",
+          max_output_tokens = 4096,
         },
         small = {
-          url = "http://localhost:11434/v1/chat/completions",
+          url = "http://localhost:11434/v1/responses",
           api_key = "",
           model = "llama3.2:1b",
+          max_output_tokens = 4096,
         },
       },
     },
@@ -297,7 +285,18 @@ function config.set_defaults(opts)
     end
     a.api_key_header = a.api_key_header or "Authorization"
     a.api_key_format = a.api_key_format or "Bearer %s"
-    a.max_completion_tokens = a.max_completion_tokens or 4096
+
+    -- Normalise tokens to max_output_tokens
+    if a.max_output_tokens == nil and a.max_completion_tokens ~= nil then
+      a.max_output_tokens = a.max_completion_tokens
+    end
+    a.max_output_tokens = a.max_output_tokens or 4096
+
+    -- Ensure native_tools is a list if provided
+    if a.native_tools ~= nil and type(a.native_tools) ~= "table" then
+      vim.notify("NeoAI: api." .. label .. ".native_tools must be a table (list)", vim.log.levels.ERROR)
+      return
+    end
   end
 
   return config.values

@@ -11,37 +11,47 @@ M.meta = {
     properties = {
       path = {
         type = "string",
-        description = "Relative path to inspect (default: current working directory).",
+        description = "Relative path to inspect. Use '.' for current working directory.",
+        default = ".",
       },
-      -- preferred_depth is the target display depth (default 3). If adaptive is true,
-      -- this is used as a baseline and may be increased/decreased based on file count.
       preferred_depth = {
         type = "number",
-        description = "Preferred display depth (default 3).",
+        description = "Preferred display depth.",
+        default = 3,
       },
-
       adaptive = {
         type = "boolean",
-        description = "Enable adaptive depth based on repository size (default true).",
+        description = "Enable adaptive depth based on repository size.",
+        default = true,
       },
       small_file_threshold = {
         type = "number",
-        description = "If total files <= threshold, expand fully (default 50).",
+        description = "If total files <= threshold, expand fully.",
+        default = 50,
       },
       large_file_threshold = {
         type = "number",
-        description = "If total files >= threshold, clamp depth (default 400).",
+        description = "If total files >= threshold, clamp depth.",
+        default = 400,
       },
     },
-    required = {},
+    required = {
+      "path",
+      "preferred_depth",
+      "adaptive",
+      "small_file_threshold",
+      "large_file_threshold",
+    },
     additionalProperties = false,
   },
 }
+
 --- Runs the project structure listing (adaptive depth)
--- @param args table { path?: string, preferred_depth?: number, adaptive?: boolean, small_file_threshold?: number, large_file_threshold?: number }
+-- @param args table { path: string, preferred_depth: number, adaptive: boolean, small_file_threshold: number, large_file_threshold: number }
 -- @return string
 M.run = function(args) -- Type: function
   args = type(args) == "table" and args or {}
+
   -- Normalise path: default to current directory when nil/empty/whitespace.
   local path = args.path
   if type(path) ~= "string" then
@@ -69,14 +79,15 @@ M.run = function(args) -- Type: function
     return "No files found in '" .. path .. "' (respecting .gitignore)."
   end
 
-  -- Determine effective display depth
+  -- Determine effective display depth with proper numeric coercion
   local adaptive = args.adaptive
   if adaptive == nil then
     adaptive = true
   end
-  local preferred_depth = args.preferred_depth or 3
-  local small_thr = args.small_file_threshold or 50
-  local large_thr = args.large_file_threshold or 400
+
+  local preferred_depth = tonumber(args.preferred_depth) or 3
+  local small_thr = tonumber(args.small_file_threshold) or 50
+  local large_thr = tonumber(args.large_file_threshold) or 400
 
   local effective_depth = preferred_depth
   local total_files = #files
