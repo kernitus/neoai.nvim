@@ -1111,10 +1111,16 @@ function chat.stream_ai_response(messages)
   api.stream(messages, function(chunk)
     if not saw_first_token then
       saw_first_token = true
-      log("stream_ai_response: first token")
       capture_thinking_duration_for_announce()
-      safe_stop_and_close_timer(thinking_timeout_timer)
-      chat.chat_state._timeout_timer = nil
+      -- Convert to a stall timer that resets on every chunk
+      local stall_s = (require("neoai.config").values.chat.stream_stall_timeout or 60)
+      thinking_timeout_timer:stop()
+      thinking_timeout_timer:start(stall_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+    else
+      -- reset stall timer on each chunk
+      local stall_s = (require("neoai.config").values.chat.stream_stall_timeout or 60)
+      thinking_timeout_timer:stop()
+      thinking_timeout_timer:start(stall_s * 1000, 0, vim.schedule_wrap(handle_timeout))
     end
 
     if chunk.type == "content" and chunk.data ~= "" then

@@ -413,13 +413,27 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                   log("api.stream: on_complete() via finish_reason=stop")
                   mark_complete("finish_reason_stop")
                 elseif finished_reason == "tool_calls" then
-                  -- Flush accumulated tool_calls immediately so the runner can start assembling UI state now.
-                  local flushed = flush_pending_tool_calls()
-                  log(
-                    "api.stream: finish_reason=tool_calls | flushed=%s; waiting for [DONE] (with exit fallback)",
-                    tostring(flushed)
-                  )
-                  -- Do not mark complete here; either [DONE] will arrive, or on_exit will finalise.
+                  -- Flush accumulated tool calls immediately
+                  if not error_reported then
+                    flush_pending_tool_calls()
+                  end
+                  log("api.stream: finish_reason=tool_calls -> early complete + cancel SSE")
+                  -- Complete now so the tool runner can start
+                  mark_complete("finish_reason_tool_calls")
+
+                  -- Proactively end the current SSE so queued streams can start
+                  vim.schedule(function()
+                    if current_job then
+                      current_job._neoai_cancelled = true
+                      pcall(function()
+                        current_job:kill(15)
+                      end)
+                      pcall(function()
+                        current_job:shutdown()
+                      end)
+                    end
+                  end)
+                  return
                 end
               end
             end
