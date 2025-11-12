@@ -236,7 +236,9 @@ function M.run_tool_calls(chat_module, tool_schemas)
                 end
                 meta.request_review = true
               end
-              content = type(resp) == "string" and resp or tostring(resp) or ""
+            else
+              -- Non-table response (string or other): coerce to string
+              content = (type(resp) == "string") and resp or tostring(resp) or ""
             end
           end
           if content == "" then

@@ -985,6 +985,9 @@ end
 ---@param tool_schemas table
 function chat.get_tool_calls(tool_schemas)
   log("chat.get_tool_calls: start | n=%d", #(tool_schemas or {}))
+  -- Ensure any previous stream is considered ended before orchestrating tools/resume.
+  chat.chat_state.streaming_active = false
+
   -- Mark that we just entered a tool-call turn and reset empty-turn retry guard
   chat.chat_state._last_tool_turn_ts = os.time()
   chat.chat_state._empty_turn_retry_used = false
@@ -999,11 +1002,6 @@ function chat.get_tool_calls(tool_schemas)
 
   -- Decide next step centrally: either present diffs now (if requested) or resume the model.
   vim.schedule(function()
-    if chat.chat_state.streaming_active then
-      log("chat.get_tool_calls: still streaming, defer decision")
-      return
-    end
-
     if summary and summary.request_review then
       log("chat.get_tool_calls: PresentEdits requested; opening %d path(s)", #(summary.paths or {}))
       maybe_open_deferred_reviews(summary and summary.paths or nil)
@@ -1041,6 +1039,7 @@ function chat.stream_ai_response(messages)
   end
 
   local reason, content, tool_calls_response = "", "", {}
+  local tool_calls_by_id = {} -- Accumulate tool calls across chunks (id -> record)
   local reasoning_summary = "" -- Accumulate streamed reasoning summary
   log("stream_ai_response: init state")
   local start_time = os.time()
@@ -1156,8 +1155,7 @@ function chat.stream_ai_response(messages)
       end
       log("stream_ai_response: chunk tool_calls | n=%d ids=%s", n, table.concat(ids, ","))
 
-      -- Normalise into our local tool_calls_response without requiring .index
-      tool_calls_response = {}
+      -- Accumulate by id across chunks (do not drop earlier calls)
       local stamp = tostring(os.time())
       for _, tc in ipairs(calls) do
         local id = tc.id or tc.call_id
@@ -1171,13 +1169,31 @@ function chat.stream_ai_response(messages)
         local fn_name = (tc["function"] and tc["function"].name) or tc.name or ""
         local fn_args = (tc["function"] and tc["function"].arguments) or tc.arguments or ""
 
-        table.insert(tool_calls_response, {
+        tool_calls_by_id[id] = {
           id = id,
           index = tc.index, -- may be nil
           type = "function",
           ["function"] = { name = fn_name, arguments = fn_args or "" },
-        })
+        }
       end
+
+      -- Rebuild stable array for status UI and for on_complete
+      local arr = {}
+      for _, rec in pairs(tool_calls_by_id) do
+        table.insert(arr, rec)
+      end
+      table.sort(arr, function(a, b)
+        if a.index ~= nil and b.index ~= nil then
+          return a.index < b.index
+        elseif a.index ~= nil then
+          return true
+        elseif b.index ~= nil then
+          return false
+        else
+          return tostring(a.id) < tostring(b.id)
+        end
+      end)
+      tool_calls_response = arr
 
       -- Show preparation status (sizes), then keep streaming content as usual
       local prep_status = render_tool_prep_status()
@@ -1202,14 +1218,34 @@ function chat.stream_ai_response(messages)
       #tool_calls_response
     )
 
-    -- Persist any streamed assistant content before handling tool calls, so it remains visible in the chat.
-    if content ~= "" then
-      local meta = { response_time = os.time() - start_time }
-      if reasoning_summary ~= "" then
-        meta.reasoning_summary = reasoning_summary
-        meta.display = "Reasoning summary:\n" .. reasoning_summary .. "\n\n" .. content
+    -- Persist any streamed assistant content/reasoning before handling tool calls,
+    -- so it remains visible in the chat even after the UI refresh.
+    do
+      local have_reason = (reason and reason ~= "")
+      local have_summary = (reasoning_summary and reasoning_summary ~= "")
+      local have_content = (content and content ~= "")
+      if have_reason or have_summary or have_content then
+        local meta = { response_time = os.time() - start_time }
+        local display_parts = {}
+
+        if have_reason then
+          table.insert(display_parts, "Reasoning:\n" .. reason)
+        end
+        if have_summary then
+          meta.reasoning_summary = reasoning_summary
+          table.insert(display_parts, "Reasoning summary:\n" .. reasoning_summary)
+        end
+        if have_content then
+          table.insert(display_parts, content)
+        end
+
+        if #display_parts > 0 then
+          meta.display = table.concat(display_parts, "\n\n")
+        end
+
+        -- Store something non-empty for content to ensure visibility if needed
+        chat.add_message(MESSAGE_TYPES.ASSISTANT, have_content and content or "(plan)", meta)
       end
-      chat.add_message(MESSAGE_TYPES.ASSISTANT, content, meta)
     end
     update_chat_display()
 
@@ -1221,6 +1257,8 @@ function chat.stream_ai_response(messages)
     end
 
     if #tool_calls_response > 0 then
+      -- The model turn ended with tool calls; mark stream as ended so the tool orchestrator can resume the loop.
+      chat.chat_state.streaming_active = false
       chat.get_tool_calls(tool_calls_response)
     else
       -- No more tools; end of turn.
