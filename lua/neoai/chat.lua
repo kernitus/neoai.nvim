@@ -1219,34 +1219,36 @@ function chat.stream_ai_response(messages)
     )
 
     -- Persist any streamed assistant content/reasoning before handling tool calls,
-    -- so it remains visible in the chat even after the UI refresh.
+    -- so it remains visible in the chat even after the UI refresh, but do NOT
+    -- put reasoning/summary into assistant content (keep it for UI only).
     do
       local have_reason = (reason and reason ~= "")
       local have_summary = (reasoning_summary and reasoning_summary ~= "")
       local have_content = (content and content ~= "")
       if have_reason or have_summary or have_content then
         local meta = { response_time = os.time() - start_time }
-        local display_parts = {}
+        local parts = {}
 
         if have_reason then
-          table.insert(display_parts, "Reasoning:\n" .. reason)
+          table.insert(parts, "Reasoning:\n" .. reason)
         end
         if have_summary then
           meta.reasoning_summary = reasoning_summary
-          table.insert(display_parts, "Reasoning summary:\n" .. reasoning_summary)
+          table.insert(parts, "Reasoning summary:\n" .. reasoning_summary)
         end
         if have_content then
-          table.insert(display_parts, content)
+          table.insert(parts, content)
         end
 
-        if #display_parts > 0 then
-          meta.display = table.concat(display_parts, "\n\n")
-        end
+        local combined = (#parts > 0) and table.concat(parts, "\n\n") or "(plan)"
+        meta.display = combined
 
-        -- Store something non-empty for content to ensure visibility if needed
-        chat.add_message(MESSAGE_TYPES.ASSISTANT, have_content and content or "(plan)", meta)
+        -- Store only the assistant's final content (no reasoning/summary) so API history stays clean.
+        local content_only = have_content and content or ""
+        chat.add_message(MESSAGE_TYPES.ASSISTANT, content_only, meta)
       end
     end
+
     update_chat_display()
 
     disable_ctrl_c_cancel()
@@ -1327,28 +1329,30 @@ function chat.stream_ai_response(messages)
       end
 
       if should_resume then
-        -- Persist a snapshot of what we streamed so far so it does not vanish on resume.
+        -- Persist a snapshot for the UI only; avoid polluting the next request payload.
         local content_txt = tostring(content or "")
         local meta = { response_time = os.time() - start_time, partial = true }
-        local display_parts = {}
+        local parts = {}
 
         if reason and reason ~= "" then
-          table.insert(display_parts, "Reasoning:\n" .. reason)
+          table.insert(parts, "Reasoning:\n" .. reason)
         end
         if content_txt ~= "" then
-          table.insert(display_parts, content_txt)
+          table.insert(parts, content_txt)
         else
-          table.insert(display_parts, "(plan)")
+          table.insert(parts, "(plan)")
         end
         if reasoning_summary and reasoning_summary ~= "" then
-          table.insert(display_parts, "Reasoning summary:\n" .. reasoning_summary)
+          table.insert(parts, "Reasoning summary:\n" .. reasoning_summary)
           meta.reasoning_summary = reasoning_summary
         end
 
-        local display = table.concat(display_parts, "\n\n")
-        meta.display = display
+        local combined = table.concat(parts, "\n\n")
+        meta.display = combined
 
-        chat.add_message(MESSAGE_TYPES.ASSISTANT, content_txt ~= "" and content_txt or "(plan)", meta)
+        -- Store empty content so api.chat_messages_to_items omits this assistant turn,
+        -- keeping the next request free of interim reasoning/snapshot text.
+        chat.add_message(MESSAGE_TYPES.ASSISTANT, "", meta)
         update_chat_display()
 
         log("chat: auto-resume (persisted partial) after %s", resume_reason)
