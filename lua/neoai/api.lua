@@ -213,7 +213,7 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
   local raw_body_chunks = {}
 
   -- Function-call accumulator keyed by call_id (Responses itemised events)
-  local fc_acc = {} -- call_id -> { name, args, index }
+  local fc_acc = {} -- call_id -> { name, args, index, args_done, item_done }
   local active_call_id = nil -- current function_call item id for deltas that omit call_id
 
   local function fc_ensure(id)
@@ -222,7 +222,7 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     end
     local rec = fc_acc[id]
     if not rec then
-      rec = { name = "", args = "", index = nil }
+      rec = { name = "", args = "", index = nil, args_done = false, item_done = false }
       fc_acc[id] = rec
     end
     return rec
@@ -233,13 +233,21 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     if not rec then
       return false
     end
+    if not rec.name or rec.name == "" then
+      -- Do not emit invalid calls; wait until the function name is known
+      return false
+    end
+    local args = rec.args
+    if args == nil or args == "" then
+      args = "{}"
+    end
     local call = {
       id = id,
       index = rec.index,
       type = "function",
       ["function"] = {
-        name = rec.name or "",
-        arguments = rec.args or "",
+        name = rec.name,
+        arguments = args,
       },
     }
     on_chunk({ type = "tool_calls", data = { call }, complete = true })
@@ -253,18 +261,38 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
   local function fc_flush_all()
     local out = {}
     for id, rec in pairs(fc_acc) do
-      table.insert(out, {
-        id = id,
-        index = rec.index,
-        type = "function",
-        ["function"] = { name = rec.name or "", arguments = rec.args or "" },
-      })
+      if rec.name and rec.name ~= "" then
+        local args = rec.args
+        if args == nil or args == "" then
+          args = "{}"
+        end
+        table.insert(out, {
+          id = id,
+          index = rec.index,
+          type = "function",
+          ["function"] = { name = rec.name, arguments = args },
+        })
+      else
+        log("api.stream: dropping nameless function_call id=%s at flush_all", tostring(id))
+      end
     end
     if #out > 0 then
       on_chunk({ type = "tool_calls", data = out, complete = true })
       fc_acc = {}
       active_call_id = nil
       return true
+    end
+    return false
+  end
+
+  local function fc_try_flush(id)
+    local rec = id and fc_acc[id] or nil
+    if not rec then
+      return false
+    end
+    -- Only flush when we have a function name and arguments have finished streaming
+    if rec.name and rec.name ~= "" and rec.args_done then
+      return fc_flush_one(id)
     end
     return false
   end
@@ -421,7 +449,6 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 end
               end
 
-              -- New Responses item: function_call item begins
               if t == "response.output_item.added" and decoded.item then
                 local it = decoded.item
                 if it.type == "function_call" then
@@ -436,12 +463,13 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                       end
                       rec.index = rec.index or idx
                       active_call_id = cid
+                      -- If arguments already finished, we can flush now
+                      fc_try_flush(cid)
                     end
                   end
                 end
               end
 
-              -- New Responses item: function_call arguments deltas
               if t == "response.function_call_arguments.delta" then
                 local cid = decoded.call_id or decoded.id or decoded.output_item_id or active_call_id
                 local idx = decoded.index
@@ -466,13 +494,16 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                   end
                 end
               elseif t == "response.function_call_arguments.done" then
-                -- Prefer to flush the active call, fall back to flushing all if unknown
-                local flushed = false
-                if active_call_id then
-                  flushed = fc_flush_one(active_call_id)
-                end
-                if not flushed then
-                  fc_flush_all()
+                -- Mark arguments complete; flush this call only when complete (name present)
+                local cid = decoded.call_id or decoded.id or decoded.output_item_id or active_call_id
+                if cid and cid ~= "" then
+                  local rec = fc_ensure(cid)
+                  if rec then
+                    rec.args_done = true
+                  end
+                  fc_try_flush(cid)
+                else
+                  -- Unknown id; do not flush prematurely
                 end
               end
 
@@ -515,14 +546,17 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
                 end
               end
 
-              -- Item completion for function_call
               if t == "response.output_item.done" and decoded.item then
                 local it = decoded.item
                 if it.type == "function_call" then
-                  -- Try to flush the specific id if present on the item, else flush active/all
+                  -- Do not flush based on item.done alone; try only if complete
                   local cid = it.call_id or it.id or it.output_item_id or active_call_id
-                  if not (cid and fc_flush_one(cid)) then
-                    fc_flush_all()
+                  if cid and cid ~= "" then
+                    local rec = fc_ensure(cid)
+                    if rec then
+                      rec.item_done = true
+                    end
+                    fc_try_flush(cid)
                   end
                 end
               end
