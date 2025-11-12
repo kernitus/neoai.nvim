@@ -406,7 +406,7 @@ local function get_edit_module()
   return mod
 end
 
-local function maybe_open_deferred_reviews()
+local function maybe_open_deferred_reviews(paths_override)
   local ed = get_edit_module()
   log(
     "maybe_open_deferred_reviews: inline_active=%s awaiting=%s",
@@ -422,7 +422,12 @@ local function maybe_open_deferred_reviews()
   if not chat.chat_state or chat.chat_state.awaiting_user_review then
     return
   end
-  local paths = ed.get_deferred_paths()
+
+  -- Use provided paths if present; otherwise query the edit module
+  local paths = paths_override
+  if not paths or #paths == 0 then
+    paths = ed.get_deferred_paths()
+  end
   log("maybe_open_deferred_reviews: candidates=%d", #(paths or {}))
   if not paths or #paths == 0 then
     return
@@ -972,18 +977,6 @@ function chat.send_to_ai()
     start_thinking_animation()
   end
 
-  -- One-shot action turn: force a user prompt so the model responds with tool calls.
-  if chat.chat_state._nudge_next_turn then
-    table.insert(messages, {
-      role = "user",
-      content = [[Do not restate a plan. Execute the next step now by calling tools only.
-- Use Read with {"file_path":"<path>","start_line":1,"end_line":-1} to open files mentioned.
-- Use SymbolIndex / TreeSitterQuery / LspDiagnostic / LspCodeAction as needed (all required fields must be provided).
-Return only function calls (no prose) until you have tool results.]],
-    })
-    chat.chat_state._nudge_next_turn = false
-  end
-
   log("chat.send_to_ai: call api.stream | payload_messages=%d", #messages)
   chat.stream_ai_response(messages)
 end
@@ -1001,18 +994,27 @@ function chat.get_tool_calls(tool_schemas)
     local name = sc and sc["function"] and sc["function"].name or "<nil>"
     log("chat.get_tool_calls: schema | idx=%s id=%s name=%s", tostring(sc and sc.index), tostring(sc and sc.id), name)
   end
-  local res = require("neoai.tool_runner").run_tool_calls(chat, tool_schemas)
+  local summary = require("neoai.tool_runner").run_tool_calls(chat, tool_schemas)
   log("chat.get_tool_calls: finished run_tool_calls")
-  -- After tools have run, attempt to open deferred reviews if we are not currently streaming
+
+  -- Decide next step centrally: either present diffs now (if requested) or resume the model.
   vim.schedule(function()
-    if not chat.chat_state.streaming_active then
-      log("chat.get_tool_calls: invoking maybe_open_deferred_reviews()")
-      maybe_open_deferred_reviews()
-    else
-      log("chat.get_tool_calls: still streaming, defer review open")
+    if chat.chat_state.streaming_active then
+      log("chat.get_tool_calls: still streaming, defer decision")
+      return
     end
+
+    if summary and summary.request_review then
+      log("chat.get_tool_calls: PresentEdits requested; opening %d path(s)", #(summary.paths or {}))
+      maybe_open_deferred_reviews(summary and summary.paths or nil)
+      return
+    end
+
+    log("chat.get_tool_calls: no present request; resuming model turn")
+    chat.send_to_ai()
   end)
-  return res
+
+  return summary
 end
 
 -- Format tools
@@ -1311,10 +1313,7 @@ function chat.stream_ai_response(messages)
         chat.add_message(MESSAGE_TYPES.ASSISTANT, content_txt ~= "" and content_txt or "(plan)", meta)
         update_chat_display()
 
-        -- Arm a one-shot nudge so the very next turn emits tool calls instead of restating plans.
-        chat.chat_state._nudge_next_turn = true
-
-        log("chat: auto-resume (persisted partial + nudge) after %s", resume_reason)
+        log("chat: auto-resume (persisted partial) after %s", resume_reason)
         vim.schedule(function()
           if not chat.chat_state.streaming_active and not input_has_text() then
             chat.send_to_ai()

@@ -10,6 +10,7 @@ local tool_names = {
   "treesitter_query",
   "symbol_index",
   "edit",
+  "present",
   "grep",
   "lsp_diagnostic",
   "lsp_code_action",

@@ -348,6 +348,14 @@ M.run = function(args)
   local orig_lines = split_lines(normalise_eol(content))
   strip_cr(orig_lines)
 
+  -- If a deferred edit exists for this path, use its latest as the current baseline
+  do
+    local entry = deferred_reviews[abs_path]
+    if entry and type(entry.latest) == "table" and #entry.latest > 0 then
+      orig_lines = vim.deepcopy(entry.latest)
+    end
+  end
+
   -- Apply order-invariant, multi-pass logic on a working copy (memory only)
   local working_lines = vim.deepcopy(orig_lines)
   local total_replacements = 0

@@ -79,6 +79,10 @@ function M.run_tool_calls(chat_module, tool_schemas)
   local ai_tools = require("neoai.ai_tools")
 
   log("tool_runner: start | n=%d", #(tool_schemas or {}))
+
+  -- Summary for the orchestrator (chat.get_tool_calls) to decide present vs resume
+  local summary = { request_review = false, paths = {} }
+
   for _, sc in ipairs(tool_schemas or {}) do
     log(
       "tool_runner: schema pre | idx=%s id=%s name=%s",
@@ -219,7 +223,19 @@ function M.run_tool_calls(chat_module, tool_schemas)
                 content = (content ~= "" and (tostring(resp.params_line) .. "\n\n" .. content))
                   or tostring(resp.params_line)
               end
-            else
+
+              -- PresentEdits integration: propagate request to open review UI
+              if resp.request_review then
+                summary.request_review = true
+                if type(resp.open_paths) == "table" then
+                  for _, p in ipairs(resp.open_paths) do
+                    table.insert(summary.paths, p)
+                  end
+                elseif type(resp.abs_path) == "string" then
+                  table.insert(summary.paths, resp.abs_path)
+                end
+                meta.request_review = true
+              end
               content = type(resp) == "string" and resp or tostring(resp) or ""
             end
           end
@@ -243,16 +259,11 @@ function M.run_tool_calls(chat_module, tool_schemas)
       end
     end
   end
-
-  if completed > 0 then
-    -- Always schedule the resume. api.stream will either start immediately or queue it whilst the current stream winds down.
-    log("tool_runner: completed=%d | scheduling send_to_ai()", completed)
-    vim.schedule(function()
-      chat_module.send_to_ai()
-    end)
-  else
+  -- Do not auto-resume here; let chat.get_tool_calls decide whether to present or resume.
+  if completed == 0 then
     c.streaming_active = false
   end
-end
 
+  return summary
+end
 return M
