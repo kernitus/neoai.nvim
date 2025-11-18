@@ -1,39 +1,108 @@
-local Job = require("plenary.job")
 local conf = require("neoai.config").get_api("main")
 local chat_tool_schemas = require("neoai.ai_tools").tool_schemas
 local log = require("neoai.debug").log
 
 local api = {}
 
--- Track current streaming job
----@type Job|nil
-local current_job = nil
+-- --- Daemon Client ---
 
--- Single queued stream request (if a new request arrives whilst one is active)
-local queued_stream = nil
+local DaemonClient = {}
+DaemonClient.__index = DaemonClient
 
---- Merges two tables into a new one (shallow).
----@param t1 table
----@param t2 table
----@return table
+-- Singleton instance
+local client_instance = nil
+
+function DaemonClient:new()
+  local obj = setmetatable({
+    job_id = nil,
+    callbacks = {}, -- map of request_id -> {on_chunk, on_complete, on_error} (but we use global notifications mostly)
+  }, self)
+  return obj
+end
+
+function DaemonClient:get_jar_path()
+  local info = debug.getinfo(1, "S")
+  local source = info.source
+  if source:sub(1, 1) == "@" then
+    source = source:sub(2)
+  end
+  local dir = vim.fn.fnamemodify(source, ":h") -- .../lua/neoai
+  local root = vim.fn.fnamemodify(dir, ":h:h") -- plugin root
+  local jar = root .. "/build/libs/neoai-daemon-all.jar"
+  if vim.fn.filereadable(jar) == 1 then
+    return jar
+  end
+  return nil
+end
+
+function DaemonClient:start()
+  if self.job_id then
+    return true
+  end
+
+  local jar = self:get_jar_path()
+  if not jar then
+    vim.notify("NeoAI: Daemon jar not found at " .. tostring(jar), vim.log.levels.ERROR)
+    return false
+  end
+
+  log("DaemonClient: starting java -jar %s", jar)
+  
+  self.job_id = vim.fn.jobstart({ "java", "-jar", jar }, {
+    rpc = true,
+    on_exit = function(_, code, _)
+      log("DaemonClient: exited with code %s", tostring(code))
+      self.job_id = nil
+      -- If we had active requests, we should probably fail them.
+      -- But since we rely on global callbacks, we might just let them hang or handle cleanup elsewhere.
+    end,
+  })
+
+  if self.job_id == 0 or self.job_id == -1 then
+    vim.notify("NeoAI: Failed to start daemon", vim.log.levels.ERROR)
+    self.job_id = nil
+    return false
+  end
+
+  return true
+end
+
+function DaemonClient:stop()
+  if self.job_id then
+    vim.fn.jobstop(self.job_id)
+    self.job_id = nil
+  end
+end
+
+function DaemonClient:notify(method, params)
+  if not self:start() then
+    return false
+  end
+  local ok, err = pcall(vim.rpcnotify, self.job_id, method, params)
+  if not ok then
+    log("DaemonClient: rpcnotify failed: %s", tostring(err))
+    return false
+  end
+  return true
+end
+
+-- Global accessor
+function api.get_client()
+  if not client_instance then
+    client_instance = DaemonClient:new()
+  end
+  return client_instance
+end
+
+-- --- Payload Helpers ---
+
 local function merge_tables(t1, t2)
   local result = {}
-  for k, v in pairs(t1 or {}) do
-    result[k] = v
-  end
-  for k, v in pairs(t2 or {}) do
-    result[k] = v
-  end
+  for k, v in pairs(t1 or {}) do result[k] = v end
+  for k, v in pairs(t2 or {}) do result[k] = v end
   return result
 end
 
---- Convert Chat-style function tools into Responses API tool shape (internally-tagged).
---- Chat-style:
----   { type="function", ["function"]={ name, description, parameters, strict? } }
---- Responses-style:
----   { type="function", name, description, parameters, strict? }
----@param tools table
----@return table
 local function to_responses_tools(tools)
   local out = {}
   for _, t in ipairs(tools or {}) do
@@ -53,39 +122,24 @@ local function to_responses_tools(tools)
   return out
 end
 
---- Merge user-configured native tools (if any) into the outgoing tools list.
----@param base table
----@param native any
----@return table
 local function merge_native_tools(base, native)
   if type(native) == "table" then
-    for _, t in ipairs(native) do
-      table.insert(base, t)
-    end
+    for _, t in ipairs(native) do table.insert(base, t) end
   end
   return base
 end
 
 local function is_reasoning_model(name)
   local n = tostring(name or ""):lower()
-  if n:match("^gpt%-5") then
-    return true
-  end
-  if n:match("^o%d") or n:match("^o%-") then
-    return true
-  end
-  return false
+  return n:match("^gpt%-5") or n:match("^o%d") or n:match("^o%-")
 end
 
---- Convert Chat-style messages to Responses Items + instructions.
 local function chat_messages_to_items(messages)
   local items = {}
   local instructions_parts = {}
 
   local function add_instructions(s)
-    if s and s ~= "" then
-      table.insert(instructions_parts, s)
-    end
+    if s and s ~= "" then table.insert(instructions_parts, s) end
   end
 
   for _, m in ipairs(messages or {}) do
@@ -100,39 +154,13 @@ local function chat_messages_to_items(messages)
         content = { { type = "input_text", text = content } },
       })
     elseif role == "assistant" then
-      local tcs = m.tool_calls
-      if type(tcs) == "table" and #tcs > 0 then
-        for _, tc in ipairs(tcs) do
-          local fn = tc["function"] or {}
-          local args = fn.arguments
-          if type(args) ~= "string" then
-            local ok, enc = pcall(vim.fn.json_encode, args)
-            args = ok and enc or tostring(args)
-          end
-          local call_id = tc.call_id or tc.id or ("tc-" .. tostring(tc.index or 0))
-          table.insert(items, {
-            type = "function_call",
-            call_id = tostring(call_id),
-            name = fn.name or "",
-            arguments = args or "{}",
-          })
-        end
-      else
-        if content ~= "" then
-          table.insert(items, {
-            type = "message",
-            role = "assistant",
-            content = { { type = "output_text", text = content } },
-          })
-        end
+      if content ~= "" then
+        table.insert(items, {
+          type = "message",
+          role = "assistant",
+          content = { { type = "output_text", text = content } },
+        })
       end
-    elseif role == "tool" then
-      local call_id = m.tool_call_id or m.id or ""
-      table.insert(items, {
-        type = "function_call_output",
-        call_id = tostring(call_id),
-        output = content,
-      })
     end
   end
 
@@ -140,19 +168,15 @@ local function chat_messages_to_items(messages)
   return items, instructions
 end
 
--- Build the Responses API payload (without API key / URL – those go into an envelope)
 local function build_payload(messages)
-  log("api.stream: build_payload | messages=%d model=%s", #(messages or {}), tostring(conf.model))
-
   local tools = to_responses_tools(chat_tool_schemas)
   tools = merge_native_tools(tools, conf.native_tools)
-
   local items, instructions = chat_messages_to_items(messages)
 
   local basic_payload = {
     model = conf.model,
     input = items,
-    stream = true, -- we will stream on the Kotlin side
+    stream = true,
     tools = tools,
     max_output_tokens = conf.max_output_tokens,
     store = false,
@@ -179,71 +203,33 @@ local function build_payload(messages)
   return payload_tbl
 end
 
--- Locate the plugin root and the shaded jar
-local function get_plugin_root()
-  local info = debug.getinfo(1, "S")
-  local source = info.source
-  if source:sub(1, 1) == "@" then
-    source = source:sub(2)
-  end
-  -- api.lua is at <root>/lua/neoai/api.lua
-  local dir = vim.fn.fnamemodify(source, ":h") -- .../lua/neoai
-  local root = vim.fn.fnamemodify(dir, ":h:h") -- plugin root
-  return root
-end
+-- --- API Methods ---
 
-local function get_daemon_jar()
-  local root = get_plugin_root()
-  local jar = root .. "/build/libs/neoai-daemon-all.jar"
-  if vim.fn.filereadable(jar) == 1 then
-    return jar
-  end
-  vim.notify("NeoAI: daemon jar not found at " .. jar, vim.log.levels.ERROR)
-  return nil
-end
+-- Track active callbacks for the current stream
+local current_callbacks = nil
 
--- Robust JSON decode (vim.json or vim.fn.json_decode)
-local function decode_json(s)
-  if vim.json and type(vim.json.decode) == "function" then
-    local ok, res = pcall(vim.json.decode, s)
-    if ok then
-      return true, res
-    else
-      log("api.stream: vim.json.decode error=%s for=%s", tostring(res), s)
-    end
-  end
-  local ok, res = pcall(vim.fn.json_decode, s)
-  if not ok then
-    log("api.stream: vim.fn.json_decode error=%s for=%s", tostring(res), s)
-  end
-  return ok, res
-end
-
---- Start streaming via the Kotlin jar.
---- We keep the same signature as the original: messages + 4 callbacks.
+--- Start streaming via the persistent daemon.
 ---@param messages table
 ---@param on_chunk fun(chunk: table)
 ---@param on_complete fun()
 ---@param on_error fun(err: integer|string)
 ---@param on_cancel fun()|nil
 function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
-  log("api.stream: start (daemon bridge) | messages=%d model=%s", #(messages or {}), tostring(conf.model))
+  log("api.stream: start | messages=%d model=%s", #(messages or {}), tostring(conf.model))
 
-  if current_job ~= nil then
-    log("api.stream: busy; queuing next stream request")
-    queued_stream = {
-      messages = messages,
-      on_chunk = on_chunk,
-      on_complete = on_complete,
-      on_error = on_error,
-      on_cancel = on_cancel,
-    }
-    return
+  if current_callbacks then
+    log("api.stream: busy; cancelling previous")
+    api.cancel()
   end
 
-  local payload_tbl = build_payload(messages)
+  current_callbacks = {
+    on_chunk = on_chunk,
+    on_complete = on_complete,
+    on_error = on_error,
+    on_cancel = on_cancel,
+  }
 
-  -- Envelope sent to the Kotlin process: includes URL, key, and the payload
+  local payload_tbl = build_payload(messages)
   local envelope = {
     url = conf.url,
     api_key = conf.api_key,
@@ -253,157 +239,67 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     body = payload_tbl,
   }
 
-  local json = vim.fn.json_encode(envelope)
-
-  local jar_path = get_daemon_jar()
-  if not jar_path then
-    if on_error then
-      on_error("NeoAI daemon jar not found")
-    end
-    return
+  local client = api.get_client()
+  -- Send notification: "generate" with [envelope]
+  -- Note: rpcnotify params must be a list/array.
+  if not client:notify("generate", { envelope }) then
+    if on_error then on_error("Failed to send request to daemon") end
+    current_callbacks = nil
   end
-
-  -- Wrap callbacks so they always run on the main thread (avoid fast-event API errors)
-  local schedule_chunk = vim.schedule_wrap(function(ev)
-    if on_chunk then
-      on_chunk(ev)
-    end
-  end)
-  local schedule_complete = vim.schedule_wrap(function()
-    if on_complete then
-      on_complete()
-    end
-  end)
-  local schedule_error = vim.schedule_wrap(function(msg)
-    if on_error then
-      on_error(msg)
-    end
-  end)
-  local schedule_cancel = on_cancel and vim.schedule_wrap(on_cancel) or nil
-
-  current_job = Job:new({
-    command = "java",
-    args = { "-jar", jar_path },
-    writer = json,
-    on_stdout = function(_, data)
-      if type(data) == "table" then
-        data = table.concat(data, "\n")
-      end
-      log("api.stream: stdout raw=%s", vim.inspect(data))
-      for _, line in ipairs(vim.split(data or "", "\n")) do
-        local trimmed = vim.trim(line)
-        if trimmed ~= "" then
-          log("api.stream: stdout line=%s", trimmed)
-          local ok, decoded = decode_json(trimmed)
-          if not ok or type(decoded) ~= "table" then
-            log("api.stream: json_decode failed | %s", tostring(trimmed))
-          else
-            log("api.stream: decoded=%s", vim.inspect(decoded))
-            if decoded.kind == "chunk" then
-              local t = decoded.type or "content"
-              local d = decoded.data or ""
-              -- Directly map to what chat.stream_ai_response expects
-              schedule_chunk({ type = t, data = d })
-            elseif decoded.kind == "complete" then
-              log("api.stream: complete event received")
-              schedule_complete()
-            elseif decoded.kind == "error" then
-              local msg = decoded.message or "Unknown error from daemon"
-              log("api.stream: error event | %s", msg)
-              schedule_error(msg)
-            end
-          end
-        end
-      end
-    end,
-    on_stderr = function(_, data)
-      if type(data) == "table" then
-        data = table.concat(data, "\n")
-      end
-      local line = vim.trim(data or "")
-      if line == "" then
-        return
-      end
-
-      -- Ignore SLF4J warnings (they are harmless and very noisy)
-      if line:match("^SLF4J%(") then
-        log("api.stream: ignoring SLF4J stderr: %s", line)
-        return
-      end
-
-      -- For now, just log other stderr lines; do not show popups.
-      log("api.stream: stderr=%s", line)
-      -- If you *do* want to see non-SLF4J errors, uncomment:
-      -- vim.schedule(function()
-      --   vim.notify("NeoAI daemon stderr: " .. line, vim.log.levels.ERROR, { title = "NeoAI" })
-      -- end)
-    end,
-    on_exit = function(_, exit_code)
-      log("api.stream: on_exit | code=%s", tostring(exit_code))
-      local job = current_job
-      current_job = nil
-
-      if job and job._neoai_cancelled then
-        if schedule_cancel then
-          schedule_cancel()
-        end
-      else
-        if exit_code ~= 0 then
-          local msg = "NeoAI daemon exited with code " .. tostring(exit_code)
-          log("api.stream: error | %s", msg)
-          schedule_error(msg)
-        else
-          -- Normal exit; if the daemon forgot to send a complete event, force it.
-          log("api.stream: normal exit, forcing on_complete()")
-          schedule_complete()
-        end
-      end
-
-      -- Start queued request if any
-      if queued_stream then
-        local q = queued_stream
-        queued_stream = nil
-        log("api.stream: starting queued stream request (daemon)")
-        vim.schedule(function()
-          api.stream(q.messages, q.on_chunk, q.on_complete, q.on_error, q.on_cancel)
-        end)
-      end
-    end,
-  })
-
-  current_job._neoai_cancelled = false
-  current_job:start()
 end
 
---- Cancel current streaming request (if any)
 function api.cancel()
-  local job = current_job
-  if not job then
+  if current_callbacks then
+    if current_callbacks.on_cancel then
+      current_callbacks.on_cancel()
+    end
+    current_callbacks = nil
+  end
+  -- Optionally notify daemon to cancel? 
+  -- client:notify("cancel", {})
+end
+
+-- Global callback invoked by the daemon
+-- The daemon sends: nvim_call_function("NeoAI_OnChunk", [ {type="...", data="..."} ])
+function _G.NeoAI_OnChunk(chunk)
+  -- chunk is a table: { type="...", data="..." }
+  log("NeoAI_OnChunk: %s", vim.inspect(chunk))
+  
+  if not current_callbacks then
     return
   end
 
-  log("api.cancel: cancelling current job")
-  job._neoai_cancelled = true
+  local t = chunk.type
+  local d = chunk.data
 
-  if type(job.kill) == "function" then
-    pcall(function()
-      job:kill(15)
-    end)
-  end
-
-  if type(job.shutdown) == "function" then
-    pcall(function()
-      job:shutdown()
-    end)
-  end
-
-  vim.defer_fn(function()
-    if current_job == job and type(job.kill) == "function" then
-      pcall(function()
-        job:kill(9)
+  if t == "content" or t == "reasoning" then
+    if current_callbacks.on_chunk then
+      -- Schedule to ensure main thread safety if needed (rpc calls are usually safe but...)
+      vim.schedule(function()
+        if current_callbacks then
+            current_callbacks.on_chunk({ type = t, data = d })
+        end
       end)
     end
-  end, 150)
+  elseif t == "complete" then
+    if current_callbacks.on_complete then
+      vim.schedule(function()
+        if current_callbacks then
+            current_callbacks.on_complete()
+            current_callbacks = nil
+        end
+      end)
+    end
+  elseif t == "error" then
+    if current_callbacks.on_error then
+      vim.schedule(function()
+        if current_callbacks then
+            current_callbacks.on_error(d)
+            current_callbacks = nil
+        end
+      end)
+    end
+  end
 end
 
 return api

@@ -21,7 +21,9 @@ dependencies {
     implementation("ai.koog:koog-agents:0.5.3")
 
     // JSON for decoding the envelope from Lua
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    // Msgpack for RPC communication
+    implementation("org.msgpack:msgpack-core:0.9.10")
 }
 
 application {

@@ -1,23 +1,29 @@
 package com.github.kernitus.neoai
 
-import ai.koog.prompt.executor.clients.openai.OpenAIResponsesParams
-import ai.koog.prompt.executor.clients.openai.models.ReasoningConfig
-import ai.koog.prompt.executor.clients.openai.models.ReasoningSummary
-import ai.koog.prompt.executor.clients.openai.base.models.ReasoningEffort
-
-
 import ai.koog.prompt.dsl.prompt
 import ai.koog.prompt.executor.clients.openai.OpenAIClientSettings
 import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
 import ai.koog.prompt.executor.clients.openai.OpenAIModels
+import ai.koog.prompt.executor.clients.openai.OpenAIResponsesParams
+import ai.koog.prompt.executor.clients.openai.base.models.ReasoningEffort
+import ai.koog.prompt.executor.clients.openai.models.ReasoningConfig
+import ai.koog.prompt.executor.clients.openai.models.ReasoningSummary
 import ai.koog.prompt.message.Message
-import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
+import kotlinx.coroutines.*
+import kotlinx.serialization.*
 import kotlinx.serialization.json.*
+import org.msgpack.core.MessagePack
+import org.msgpack.core.MessagePacker
+import org.msgpack.core.MessageUnpacker
+import org.msgpack.value.ArrayValue
+import org.msgpack.value.ValueType
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+
+// --- Data Models ---
 
 @Serializable
-data class Envelope(
+data class GenerateParams(
     val url: String,
     @SerialName("api_key") val apiKey: String,
     @SerialName("api_key_header") val apiKeyHeader: String = "Authorization",
@@ -26,42 +32,11 @@ data class Envelope(
     val body: JsonElement
 )
 
+// --- Helpers ---
+
 private val json = Json { ignoreUnknownKeys = true }
 
-/**
- * Extract the text of the last user message from a Responses-style payload:
- * body.input is an array of items; we want the last item with
- *   type == "message", role == "user"
- * then the first content element with type == "input_text".
- */
-private fun extractLastUserText(body: JsonElement): String? {
-    val obj = body as? JsonObject ?: return null
-    val input = obj["input"] as? JsonArray ?: return null
-
-    for (i in input.size - 1 downTo 0) {
-        val item = input[i] as? JsonObject ?: continue
-        val type = item["type"]?.jsonPrimitive?.contentOrNull ?: continue
-        if (type != "message") continue
-
-        val role = item["role"]?.jsonPrimitive?.contentOrNull ?: ""
-        if (role != "user") continue
-
-        val contents = item["content"] as? JsonArray ?: continue
-        for (c in contents) {
-            val cObj = c as? JsonObject ?: continue
-            val cType = cObj["type"]?.jsonPrimitive?.contentOrNull
-            if (cType == "input_text" || cType == "text" || cType == "input") {
-                val text = cObj["text"]?.jsonPrimitive?.contentOrNull
-                if (!text.isNullOrBlank()) {
-                    return text
-                }
-            }
-        }
-    }
-    return null
-}
-
-// Custom GPT‑5.1 model: reuse GPT‑5 capabilities but send id "gpt-5.1".
+// Custom GPT‑5.1 model
 private val GPT5_1 = OpenAIModels.Chat.GPT5.copy(id = "gpt-5.1")
 
 private fun pickModel(name: String): ai.koog.prompt.llm.LLModel {
@@ -72,48 +47,124 @@ private fun pickModel(name: String): ai.koog.prompt.llm.LLModel {
     }
 }
 
-fun main() = runBlocking {
-    val stdin = generateSequence(::readLine).joinToString("\n").trim()
-    if (stdin.isEmpty()) {
-        println("""{"kind":"error","message":"Empty stdin (no envelope received)"}""")
-        return@runBlocking
-    }
-
-    val env = try {
-        json.decodeFromString<Envelope>(stdin)
-    } catch (e: Exception) {
-        val msg = e.message ?: e.toString()
-        val msgJson = json.encodeToString(msg)
-        println("""{"kind":"error","message":$msgJson}""")
-        return@runBlocking
-    }
-
-    // Prefer envelope API key; otherwise fall back to OPENAI_API_KEY.
-    val apiKey = if (env.apiKey.isNotBlank()) {
-        env.apiKey
-    } else {
-        System.getenv("OPENAI_API_KEY") ?: run {
-            val msg = "No API key provided (api_key empty and OPENAI_API_KEY not set)"
-            val msgJson = json.encodeToString(msg)
-            println("""{"kind":"error","message":$msgJson}""")
-            return@runBlocking
+private fun extractLastUserText(body: JsonElement): String? {
+    val obj = body as? JsonObject ?: return null
+    val input = obj["input"] as? JsonArray ?: return null
+    for (i in input.size - 1 downTo 0) {
+        val item = input[i] as? JsonObject ?: continue
+        val type = item["type"]?.jsonPrimitive?.contentOrNull ?: continue
+        if (type != "message") continue
+        val role = item["role"]?.jsonPrimitive?.contentOrNull ?: ""
+        if (role != "user") continue
+        val contents = item["content"] as? JsonArray ?: continue
+        for (c in contents) {
+            val cObj = c as? JsonObject ?: continue
+            val cType = cObj["type"]?.jsonPrimitive?.contentOrNull
+            if (cType == "input_text" || cType == "text" || cType == "input") {
+                val text = cObj["text"]?.jsonPrimitive?.contentOrNull
+                if (!text.isNullOrBlank()) return text
+            }
         }
     }
+    return null
+}
 
-    val userText = extractLastUserText(env.body) ?: run {
-        val msg = "Could not extract last user message from payload"
-        val msgJson = json.encodeToString(msg)
-        println("""{"kind":"error","message":$msgJson}""")
-        return@runBlocking
+// --- Main ---
+
+fun main() = runBlocking {
+    val inputStream = BufferedInputStream(System.`in`)
+    val outputStream = BufferedOutputStream(System.out)
+    
+    val unpacker = MessagePack.newDefaultUnpacker(inputStream)
+    val packer = MessagePack.newDefaultPacker(outputStream)
+
+    while (isActive) {
+        try {
+            if (!unpacker.hasNext()) {
+                break
+            }
+            
+            // Read the next value, expected to be an array
+            val value = unpacker.unpackValue()
+            if (!value.isArrayValue) {
+                continue
+            }
+            
+            val array = value.asArrayValue()
+            if (array.size() < 3) {
+                continue
+            }
+
+            val type = array[0].asIntegerValue().toInt()
+            
+            if (type == 0) { // Request: [0, msgid, method, params]
+                if (array.size() < 4) continue
+                val msgId = array[1].asIntegerValue().toInt()
+                val method = array[2].asStringValue().asString()
+                val paramsArray = array[3].asArrayValue()
+                
+                handleMethod(method, paramsArray, packer)
+
+            } else if (type == 2) { // Notification: [2, method, params]
+                val method = array[1].asStringValue().asString()
+                val paramsArray = array[2].asArrayValue()
+                
+                handleMethod(method, paramsArray, packer)
+            }
+            
+        } catch (e: Exception) {
+            System.err.println("Error in main loop: ${e.message}")
+            break
+        }
     }
+}
 
+fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker) {
+    if (method == "generate") {
+        // params is [ { ... } ]
+        if (paramsArray.size() > 0) {
+            val paramValue = paramsArray[0].toString() 
+            
+            try {
+                val generateParams = json.decodeFromString<GenerateParams>(paramValue)
+                // Launch in background
+                GlobalScope.launch {
+                    generate(generateParams, packer)
+                }
+            } catch (e: Exception) {
+                sendError("Invalid params: ${e.message}", packer)
+            }
+        }
+    } else {
+        // Ignore unknown methods
+    }
+}
+
+// --- Generation Logic ---
+
+suspend fun generate(env: GenerateParams, packer: MessagePacker) {
     try {
-        // Configure client; allow overriding base URL from envelope if needed.
-        val baseUrl = env.url.substringBefore("/v1")  // e.g. https://api.openai.com
+        // Prefer envelope API key; otherwise fall back to OPENAI_API_KEY.
+        val apiKey = if (env.apiKey.isNotBlank()) {
+            env.apiKey
+        } else {
+            System.getenv("OPENAI_API_KEY") ?: ""
+        }
+
+        if (apiKey.isBlank()) {
+            sendError("No API key provided", packer)
+            return
+        }
+
+        val userText = extractLastUserText(env.body) ?: run {
+            sendError("Could not extract last user message", packer)
+            return
+        }
+
+        val baseUrl = env.url.substringBefore("/v1")
         val settings = OpenAIClientSettings(baseUrl = baseUrl)
         val client = OpenAILLMClient(apiKey, settings)
 
-        // LLMParams with reasoning effort; Koog will map this to Responses API ReasoningConfig.
         val params = OpenAIResponsesParams(
             reasoning = ReasoningConfig(
                 effort = ReasoningEffort.HIGH,
@@ -121,8 +172,6 @@ fun main() = runBlocking {
             )
         )
 
-
-        // Build a simple prompt: you can refine the system message as needed.
         val prompt = prompt("neoai", params) {
             system("You are a helpful AI assistant running inside NeoVim.")
             user(userText)
@@ -130,43 +179,63 @@ fun main() = runBlocking {
 
         val model = pickModel(env.model)
 
-        // Non-streaming call using OpenAI Responses API under the hood.
-        val responses: List<Message.Response> = client.execute(
-            prompt = prompt,
-            model = model,
-            tools = emptyList()
-        )
+        // Execute (blocking for now to fix build)
+        val responses = client.execute(prompt = prompt, model = model, tools = emptyList())
 
-        // Map Koog responses to our simple chunk protocol.
         for (resp in responses) {
-            when (resp) {
+             when (resp) {
                 is Message.Reasoning -> {
-                    val text = resp.content
-                    if (text.isNotBlank()) {
-                        val dataJson = json.encodeToString(text)
-                        println("""{"kind":"chunk","type":"reasoning","data":$dataJson}""")
+                    if (resp.content.isNotBlank()) {
+                        sendChunk("reasoning", resp.content, packer)
                     }
                 }
-
                 is Message.Assistant -> {
-                    val text = resp.content
-                    if (text.isNotBlank()) {
-                        val dataJson = json.encodeToString(text)
-                        println("""{"kind":"chunk","type":"content","data":$dataJson}""")
+                    if (resp.content.isNotBlank()) {
+                        sendChunk("content", resp.content, packer)
                     }
                 }
-
-                is Message.Tool.Call -> {
-                    // Optional: map tool calls to 'tool_calls' chunks later.
-                }
+                else -> {}
             }
         }
+        
+        sendComplete(packer)
 
-        println("""{"kind":"complete"}""")
     } catch (e: Exception) {
-        val msg = e.message ?: e.toString()
-        val msgJson = json.encodeToString(msg)
-        println("""{"kind":"error","message":$msgJson}""")
+        sendError(e.message ?: "Unknown error", packer)
     }
 }
 
+// --- RPC Sending Helpers ---
+
+fun sendChunk(type: String, data: String, packer: MessagePacker) {
+    synchronized(packer) {
+        // Notification: [2, "nvim_exec_lua", ["NeoAI_OnChunk(...)", [{type:..., data:...}]]]
+        
+        packer.packArrayHeader(3)
+        packer.packInt(2) // Notification type
+        packer.packString("nvim_exec_lua")
+        
+        packer.packArrayHeader(2) // [code, args]
+        packer.packString("NeoAI_OnChunk(...)")
+        
+        packer.packArrayHeader(1) // args array (1 arg)
+        
+        // The arg is a map/struct: {type: "content", data: "..."}
+        // We can pack it as a map.
+        packer.packMapHeader(2)
+        packer.packString("type")
+        packer.packString(type)
+        packer.packString("data")
+        packer.packString(data)
+        
+        packer.flush()
+    }
+}
+
+fun sendComplete(packer: MessagePacker) {
+    sendChunk("complete", "", packer)
+}
+
+fun sendError(msg: String, packer: MessagePacker) {
+    sendChunk("error", msg, packer)
+}

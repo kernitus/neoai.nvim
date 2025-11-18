@@ -564,6 +564,22 @@ function chat.setup()
     })
   end)
 
+  -- Ensure daemon is stopped on exit
+  pcall(function()
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+      group = vim.api.nvim_create_augroup("NeoAIDaemonCleanup", { clear = true }),
+      callback = function()
+        local ok, api = pcall(require, "neoai.api")
+        if ok and api.get_client then
+          local client = api.get_client()
+          if client then
+            client:stop()
+          end
+        end
+      end,
+    })
+  end)
+
   -- Initialise storage backend (guarded, with dir creation and error surfacing)
   local db_path = (chat.chat_state.config and chat.chat_state.config.database_path) or nil
   if not db_path or db_path == "" then
