@@ -242,7 +242,7 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
   local client = api.get_client()
   -- Send notification: "generate" with [envelope]
   -- Note: rpcnotify params must be a list/array.
-  if not client:notify("generate", { envelope }) then
+  if not client:notify("generate", envelope) then
     if on_error then on_error("Failed to send request to daemon") end
     current_callbacks = nil
   end

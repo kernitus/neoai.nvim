@@ -24,6 +24,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
     // Msgpack for RPC communication
     implementation("org.msgpack:msgpack-core:0.9.10")
+    // Msgpack for Kotlin object serialisation
+    implementation("com.ensarsarajcic.kotlinx:serialization-msgpack:0.6.0")
+
 }
 
 application {
@@ -44,4 +47,3 @@ kotlin {
 tasks.named<Jar>("shadowJar") {
     archiveFileName.set("neoai-daemon-all.jar")
 }
-
