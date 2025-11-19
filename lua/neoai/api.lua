@@ -272,7 +272,7 @@ function _G.NeoAI_OnChunk(chunk)
   local t = chunk.type
   local d = chunk.data
 
-  if t == "content" or t == "reasoning" then
+  if t == "content" or t == "reasoning" or t == "tool_call" then
     if current_callbacks.on_chunk then
       -- Schedule to ensure main thread safety if needed (rpc calls are usually safe but...)
       vim.schedule(function()

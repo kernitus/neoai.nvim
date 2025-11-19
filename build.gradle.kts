@@ -19,6 +19,7 @@ dependencies {
 
     // Koog agents
     implementation("ai.koog:koog-agents:0.5.3")
+    implementation("ai.koog:agents-tools:0.5.3")
 
     // JSON for decoding the envelope from Lua
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")

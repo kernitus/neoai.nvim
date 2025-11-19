@@ -10,7 +10,20 @@ import ai.koog.prompt.executor.clients.openai.models.ReasoningConfig
 import ai.koog.prompt.executor.clients.openai.models.ReasoningSummary
 import ai.koog.prompt.message.Message
 import ai.koog.prompt.streaming.StreamFrame
+import ai.koog.agents.ext.tool.file.ReadFileTool
+import ai.koog.agents.ext.tool.file.EditFileTool
+import ai.koog.agents.ext.tool.file.ListDirectoryTool
+import ai.koog.agents.core.tools.ToolRegistry
+import ai.koog.agents.core.agent.AIAgent
+import ai.koog.agents.core.feature.handler.agent.AgentEventHandler
+import ai.koog.agents.core.feature.model.events.LLMCallStartingEvent
+import ai.koog.agents.core.feature.model.events.LLMCallChunkEvent
+import ai.koog.agents.core.feature.model.events.LLMCallEndEvent
+import ai.koog.agents.core.feature.handler.agent.tool.ToolCallStartEvent
+import ai.koog.agents.core.feature.handler.agent.tool.ToolCallEndEvent
+import ai.koog.prompt.executor.simpleOpenAIExecutor
 import kotlinx.coroutines.*
+import ai.koog.rag.base.files.JVMFileSystemProvider
 import org.msgpack.core.MessagePack
 import org.msgpack.core.MessagePacker
 import org.msgpack.core.MessageUnpacker
@@ -18,6 +31,8 @@ import org.msgpack.value.ArrayValue
 import org.msgpack.value.ValueType
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 
 // Define the scope for background tasks
 // Dispatchers.IO is best for network requests; SupervisorJob prevents one crash from killing the whole scope
@@ -88,6 +103,52 @@ private fun extractLastUserText(body: org.msgpack.value.Value): String? {
         }
     }
     return null
+}
+
+private fun formatToolsForPrompt(toolsVal: org.msgpack.value.Value?): String {
+    if (toolsVal == null || !toolsVal.isArrayValue) {
+        return ""
+    }
+
+    val toolsArray = toolsVal.asArrayValue()
+    val toolDescriptions = mutableListOf<String>()
+
+    for (i in 0 until toolsArray.size()) {
+        val tool = toolsArray[i]
+        if (!tool.isMapValue) continue
+        val toolMap = tool.asMapValue().map()
+
+        fun getStr(key: String): String? {
+            val k = org.msgpack.value.ValueFactory.newString(key)
+            val v = toolMap[k]
+            return if (v != null && v.isStringValue) v.asStringValue().asString() else null
+        }
+
+        val type = getStr("type")
+        if (type != "function") continue
+
+        val funcKey = org.msgpack.value.ValueFactory.newString("function")
+        val funcVal = toolMap[funcKey]
+        if (funcVal == null || !funcVal.isMapValue) continue
+
+        val funcMap = funcVal.asMapValue().map()
+        fun getFuncStr(key: String): String? {
+            val k = org.msgpack.value.ValueFactory.newString(key)
+            val v = funcMap[k]
+            return if (v != null && v.isStringValue) v.asStringValue().asString() else null
+        }
+
+        val name = getFuncStr("name") ?: continue
+        val description = getFuncStr("description") ?: ""
+
+        toolDescriptions.add("- **$name**: $description")
+    }
+
+    return if (toolDescriptions.isEmpty()) {
+        "No tools available."
+    } else {
+        toolDescriptions.joinToString("\n")
+    }
 }
 
 // --- Main ---
@@ -216,26 +277,39 @@ suspend fun generate(
         return
     }
 
-    val userText = extractLastUserText(body) ?: run {
-        sendError("Could not extract last user message", packer)
+    if (!body.isMapValue) {
+        sendError("Body must be a map/object", packer)
         return
     }
+
+    val bodyMap = body.asMapValue().map()
+
+    // Helper to get value from map
+    fun getValue(key: String): org.msgpack.value.Value? {
+        val k = org.msgpack.value.ValueFactory.newString(key)
+        return bodyMap[k]
+    }
+
+    // Extract input (array of messages)
+    val inputVal = getValue("input")
+    if (inputVal == null || !inputVal.isArrayValue) {
+        sendError("Missing or invalid 'input' field", packer)
+        return
+    }
+
+    // Extract tools array
+    val toolsVal = getValue("tools")
 
     val baseUrl = url.substringBefore("/v1")
     val settings = OpenAIClientSettings(baseUrl = baseUrl)
     val client = OpenAILLMClient(finalApiKey, settings)
 
     val params = if (isReasoningModel(modelName)) {
-        // Extract reasoning options from body
         var effortStr: String? = null
-
-        if (body.isMapValue) {
-            val map = body.asMapValue().map()
-            val keyEffort = org.msgpack.value.ValueFactory.newString("reasoning_effort")
-            val valEffort = map[keyEffort]
-            if (valEffort != null && valEffort.isStringValue) {
-                effortStr = valEffort.asStringValue().asString()
-            }
+        val keyEffort = org.msgpack.value.ValueFactory.newString("reasoning_effort")
+        val valEffort = bodyMap[keyEffort]
+        if (valEffort != null && valEffort.isStringValue) {
+            effortStr = valEffort.asStringValue().asString()
         }
 
         val effort = when (effortStr?.lowercase()) {
@@ -254,42 +328,134 @@ suspend fun generate(
         OpenAIResponsesParams()
     }
 
+    // Read system prompt from file
+    val systemPromptFile = java.io.File("lua/neoai/prompts/system_prompt.md")
+    val systemPrompt = if (systemPromptFile.exists()) {
+        val content = systemPromptFile.readText()
+        // Replace template variables
+        val toolsFormatted = formatToolsForPrompt(toolsVal)
+        content
+            .replace("%tools", toolsFormatted)
+            .replace("%agents", "") // TODO: Read AGENTS.md if exists
+    } else {
+        "You are a helpful AI assistant running inside NeoVim."
+    }
+
+    // Build prompt
     val prompt = prompt("neoai", params) {
-        system("You are a helpful AI assistant running inside NeoVim.")
-        user(userText)
+        system(systemPrompt)
+
+        // Process input messages (conversation history)
+        val inputArray = inputVal.asArrayValue()
+        for (i in 0 until inputArray.size()) {
+            val item = inputArray[i]
+            if (!item.isMapValue) continue
+            val itemMap = item.asMapValue().map()
+
+            fun getItemString(key: String): String? {
+                val k = org.msgpack.value.ValueFactory.newString(key)
+                val v = itemMap[k] ?: return null
+                return if (v.isStringValue) v.asStringValue().asString() else null
+            }
+
+            val type = getItemString("type") ?: continue
+            if (type != "message") continue
+
+            val role = getItemString("role") ?: continue
+
+            // Extract content from the message
+            val contentKey = org.msgpack.value.ValueFactory.newString("content")
+            val contentVal = itemMap[contentKey]
+            if (contentVal == null || !contentVal.isArrayValue) continue
+
+            val contentParts = mutableListOf<String>()
+            val contents = contentVal.asArrayValue()
+            for (c in contents) {
+                if (!c.isMapValue) continue
+                val cObj = c.asMapValue().map()
+
+                fun getContentString(key: String): String? {
+                    val k = org.msgpack.value.ValueFactory.newString(key)
+                    val v = cObj[k] ?: return null
+                    return if (v.isStringValue) v.asStringValue().asString() else null
+                }
+
+                val cType = getContentString("type")
+                val text = getContentString("text")
+
+                if ((cType == "input_text" || cType == "output_text" || cType == "text") && !text.isNullOrBlank()) {
+                    contentParts.add(text)
+                }
+            }
+
+            val fullContent = contentParts.joinToString("\n")
+            if (fullContent.isBlank()) continue
+
+            when (role) {
+                "user" -> user(fullContent)
+                "assistant" -> assistant(fullContent)
+                else -> {
+                    // Skip unknown roles
+                }
+            }
+        }
     }
 
     val model = pickModel(modelName)
 
-    // Execute streaming
-    try {
-        val stream = client.executeStreaming(prompt = prompt, model = model, tools = emptyList())
+    // Create tool registry with built-in tools
+    val toolRegistry = ToolRegistry {
+        tool(ReadFileTool(JVMFileSystemProvider.ReadOnly))
+        tool(ListDirectoryTool(JVMFileSystemProvider.ReadOnly))
+        tool(EditFileTool(JVMFileSystemProvider.ReadWrite))
+    }
 
-        stream.collect { frame ->
-            when (frame) {
-                is StreamFrame.Append -> {
-                    // Check if it's reasoning or content
-                    // The API might distinguish, or we might need to check the frame properties if available.
-                    // For now, assuming text is content. 
-                    // If reasoning is supported, it might come as a different frame type or property.
-                    // Looking at the docs: "is StreamFrame.Append -> print(frame.text)"
-                    // Let's assume it's content for now.
-                    if (frame.text.isNotEmpty()) {
-                        sendChunk("content", frame.text, packer)
-                    }
-                }
-
-                is StreamFrame.End -> {
-                    // End of stream
-                }
-
-                else -> {
-                    // Ignore other frames (ToolCall, etc. for now)
-                }
+    // Create event handler for streaming responses to Lua
+    val eventHandler = object : AgentEventHandler() {
+        override suspend fun onLLMCallChunk(event: LLMCallChunkEvent) {
+            // Stream LLM output chunks
+            if (event.chunk.isNotEmpty()) {
+                sendChunk("content", event.chunk, packer)
             }
         }
+
+        override suspend fun onToolCallStart(event: ToolCallStartEvent) {
+            // Notify that a tool is being called
+            sendChunk("tool_call_start", "Calling ${event.toolName}...", packer)
+        }
+
+        override suspend fun onToolCallEnd(event: ToolCallEndEvent) {
+            // Send tool results
+            val result = event.result?.toString() ?: "No result"
+            sendChunk("tool_result", "[${event.toolName}]: $result", packer)
+        }
+    }
+
+    // Create AIAgent with tools and streaming support
+    try {
+        val baseUrl = url.substringBefore("/v1")
+        val executor = simpleOpenAIExecutor(
+            apiKey = finalApiKey,
+            baseUrl = baseUrl
+        )
+
+        val agent = AIAgent(
+            promptExecutor = executor,
+            llmModel = model,
+            systemPrompt = systemPrompt,
+            toolRegistry = toolRegistry,
+            maxIterations = 20,
+            eventHandler = eventHandler
+        )
+
+        // Extract the last user message for agent input
+        val userInput = extractLastUserText(body) ?: "Continue the conversation"
+
+        // Run the agent - it will automatically execute tools and stream responses
+        agent.run(userInput)
+
     } catch (e: Exception) {
-        sendError("Streaming failed: ${e.message}", packer)
+        sendError("Agent execution failed: ${e.message}", packer)
         return
     }
 
@@ -318,6 +484,42 @@ fun sendChunk(type: String, data: String, packer: MessagePacker) {
         packer.packString(type)
         packer.packString("data")
         packer.packString(data)
+
+        packer.flush()
+    }
+}
+
+fun sendToolCall(id: String?, name: String, arguments: String, packer: MessagePacker) {
+    synchronized(packer) {
+        // Notification: [2, "nvim_exec_lua", ["NeoAI_OnChunk(...)", [{type:"tool_call", data:{id:..., name:..., arguments:...}}]]]
+
+        packer.packArrayHeader(3)
+        packer.packInt(2) // Notification type
+        packer.packString("nvim_exec_lua")
+
+        packer.packArrayHeader(2) // [code, args]
+        packer.packString("NeoAI_OnChunk(...)")
+
+        packer.packArrayHeader(1) // args array (1 arg)
+
+        // The arg is a map: {type: "tool_call", data: {id, name, arguments}}
+        packer.packMapHeader(2)
+        packer.packString("type")
+        packer.packString("tool_call")
+        packer.packString("data")
+
+        // Nested map for tool call data
+        packer.packMapHeader(3)
+        packer.packString("id")
+        if (id != null) {
+            packer.packString(id)
+        } else {
+            packer.packNil()
+        }
+        packer.packString("name")
+        packer.packString(name)
+        packer.packString("arguments")
+        packer.packString(arguments)
 
         packer.flush()
     }
