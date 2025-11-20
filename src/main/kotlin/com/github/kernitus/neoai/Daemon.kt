@@ -9,11 +9,22 @@ import ai.koog.prompt.executor.clients.openai.base.models.ReasoningEffort
 import ai.koog.prompt.executor.clients.openai.models.ReasoningConfig
 import ai.koog.prompt.executor.clients.openai.models.ReasoningSummary
 import ai.koog.prompt.message.Message
+import ai.koog.prompt.message.RequestMetaInfo
+import com.github.kernitus.neoai.ai_tools.CustomReadFileTool
+import com.github.kernitus.neoai.ai_tools.CustomListDirectoryTool
+import com.github.kernitus.neoai.ai_tools.CustomEditFileTool
 import ai.koog.prompt.streaming.StreamFrame
-import ai.koog.agents.ext.tool.file.ReadFileTool
-import ai.koog.agents.ext.tool.file.EditFileTool
-import ai.koog.agents.ext.tool.file.ListDirectoryTool
 import ai.koog.agents.core.tools.ToolRegistry
+import ai.koog.agents.core.agent.AIAgent
+import ai.koog.agents.core.agent.GraphAIAgent.FeatureContext
+import ai.koog.agents.core.dsl.builder.forwardTo
+import ai.koog.agents.core.dsl.builder.strategy
+import ai.koog.agents.core.dsl.extension.nodeExecuteMultipleTools
+import ai.koog.agents.core.dsl.extension.nodeLLMRequestStreamingAndSendResults
+import ai.koog.agents.core.dsl.extension.onMultipleToolCalls
+import ai.koog.agents.core.environment.ReceivedToolResult
+import ai.koog.agents.features.eventHandler.feature.handleEvents
+import ai.koog.prompt.executor.llms.all.simpleOpenAIExecutor
 import kotlinx.coroutines.*
 import ai.koog.rag.base.files.JVMFileSystemProvider
 import org.msgpack.core.MessagePack
@@ -143,6 +154,52 @@ private fun formatToolsForPrompt(toolsVal: org.msgpack.value.Value?): String {
     }
 }
 
+// --- Strategy for Streaming with Tools ---
+
+private fun streamingWithToolsStrategy() = strategy<List<Message.Request>, String>("streaming_loop") {
+    val executeMultipleTools by nodeExecuteMultipleTools(parallelTools = true)
+    val nodeStreaming by nodeLLMRequestStreamingAndSendResults<List<Message.Request>>()
+
+    val applyRequestToSession by node<List<Message.Request>, List<Message.Request>> { input ->
+        llm.writeSession {
+            appendPrompt {
+                input.filterIsInstance<Message.User>()
+                    .forEach {
+                        user(it.content)
+                    }
+
+                tool {
+                    input.filterIsInstance<Message.Tool.Result>()
+                        .forEach {
+                            result(it)
+                        }
+                }
+            }
+            input
+        }
+    }
+
+    val mapToolCallsToRequests by node<List<ReceivedToolResult>, List<Message.Request>> { input ->
+        input.map { it.toMessage() }
+    }
+
+    // Define edges
+    edge(nodeStart forwardTo applyRequestToSession)
+    edge(applyRequestToSession forwardTo nodeStreaming)
+    edge(nodeStreaming forwardTo executeMultipleTools onMultipleToolCalls { true })
+    edge(executeMultipleTools forwardTo mapToolCallsToRequests)
+    edge(mapToolCallsToRequests forwardTo applyRequestToSession)
+    edge(
+        nodeStreaming forwardTo nodeFinish onCondition {
+            it.filterIsInstance<Message.Tool.Call>().isEmpty()
+        } transformed {
+            // Extract assistant message content
+            it.filterIsInstance<Message.Assistant>()
+                .firstOrNull()?.content ?: ""
+        }
+    )
+}
+
 // --- Main ---
 
 fun main() = runBlocking {
@@ -222,6 +279,7 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
                 val url = getStr("url")
                 val apiKey = getStr("api_key")
                 val model = getStr("model")
+                val cwd = getStr("cwd", System.getProperty("user.dir") ?: ".")
 
                 val bodyKey = org.msgpack.value.ValueFactory.newString("body")
                 val body = mapData[bodyKey]
@@ -234,7 +292,7 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
                 // 2. Launch in background
                 scope.launch {
                     try {
-                        generate(url, apiKey, model, body, packer)
+                        generate(url, apiKey, model, body, cwd, packer)
                     } catch (e: Exception) {
                         // 3. Handle generation errors inside the coroutine
                         sendError("Generation failed: ${e.message}", packer)
@@ -257,6 +315,7 @@ suspend fun generate(
     apiKey: String,
     modelName: String,
     body: org.msgpack.value.Value,
+    cwd: String,
     packer: MessagePacker
 ) {
     // Prefer envelope API key; otherwise fall back to OPENAI_API_KEY.
@@ -289,36 +348,8 @@ suspend fun generate(
         return
     }
 
-    // Extract tools array
+    // Extract tools array (for system prompt template)
     val toolsVal = getValue("tools")
-
-    val baseUrl = url.substringBefore("/v1")
-    val settings = OpenAIClientSettings(baseUrl = baseUrl)
-    val client = OpenAILLMClient(finalApiKey, settings)
-
-    val params = if (isReasoningModel(modelName)) {
-        var effortStr: String? = null
-        val keyEffort = org.msgpack.value.ValueFactory.newString("reasoning_effort")
-        val valEffort = bodyMap[keyEffort]
-        if (valEffort != null && valEffort.isStringValue) {
-            effortStr = valEffort.asStringValue().asString()
-        }
-
-        val effort = when (effortStr?.lowercase()) {
-            "low" -> ReasoningEffort.LOW
-            "high" -> ReasoningEffort.HIGH
-            else -> ReasoningEffort.MEDIUM // Default
-        }
-
-        OpenAIResponsesParams(
-            reasoning = ReasoningConfig(
-                effort = effort,
-                summary = ReasoningSummary.AUTO
-            )
-        )
-    } else {
-        OpenAIResponsesParams()
-    }
 
     // Read system prompt from file
     val systemPromptFile = java.io.File("lua/neoai/prompts/system_prompt.md")
@@ -333,111 +364,122 @@ suspend fun generate(
         "You are a helpful AI assistant running inside NeoVim."
     }
 
-    // Build prompt
-    val prompt = prompt("neoai", params) {
-        system(systemPrompt)
+    // Convert msgpack input to Koog Message.Request format
+    val messages = mutableListOf<Message.Request>()
+    val inputArray = inputVal.asArrayValue()
+    for (i in 0 until inputArray.size()) {
+        val item = inputArray[i]
+        if (!item.isMapValue) continue
+        val itemMap = item.asMapValue().map()
 
-        // Process input messages (conversation history)
-        val inputArray = inputVal.asArrayValue()
-        for (i in 0 until inputArray.size()) {
-            val item = inputArray[i]
-            if (!item.isMapValue) continue
-            val itemMap = item.asMapValue().map()
+        fun getItemString(key: String): String? {
+            val k = org.msgpack.value.ValueFactory.newString(key)
+            val v = itemMap[k] ?: return null
+            return if (v.isStringValue) v.asStringValue().asString() else null
+        }
 
-            fun getItemString(key: String): String? {
+        val type = getItemString("type") ?: continue
+        if (type != "message") continue
+
+        val role = getItemString("role") ?: continue
+
+        // Extract content from the message
+        val contentKey = org.msgpack.value.ValueFactory.newString("content")
+        val contentVal = itemMap[contentKey]
+        if (contentVal == null || !contentVal.isArrayValue) continue
+
+        val contentParts = mutableListOf<String>()
+        val contents = contentVal.asArrayValue()
+        for (c in contents) {
+            if (!c.isMapValue) continue
+            val cObj = c.asMapValue().map()
+
+            fun getContentString(key: String): String? {
                 val k = org.msgpack.value.ValueFactory.newString(key)
-                val v = itemMap[k] ?: return null
+                val v = cObj[k] ?: return null
                 return if (v.isStringValue) v.asStringValue().asString() else null
             }
 
-            val type = getItemString("type") ?: continue
-            if (type != "message") continue
+            val cType = getContentString("type")
+            val text = getContentString("text")
 
-            val role = getItemString("role") ?: continue
-
-            // Extract content from the message
-            val contentKey = org.msgpack.value.ValueFactory.newString("content")
-            val contentVal = itemMap[contentKey]
-            if (contentVal == null || !contentVal.isArrayValue) continue
-
-            val contentParts = mutableListOf<String>()
-            val contents = contentVal.asArrayValue()
-            for (c in contents) {
-                if (!c.isMapValue) continue
-                val cObj = c.asMapValue().map()
-
-                fun getContentString(key: String): String? {
-                    val k = org.msgpack.value.ValueFactory.newString(key)
-                    val v = cObj[k] ?: return null
-                    return if (v.isStringValue) v.asStringValue().asString() else null
-                }
-
-                val cType = getContentString("type")
-                val text = getContentString("text")
-
-                if ((cType == "input_text" || cType == "output_text" || cType == "text") && !text.isNullOrBlank()) {
-                    contentParts.add(text)
-                }
+            if ((cType == "input_text" || cType == "output_text" || cType == "text") && !text.isNullOrBlank()) {
+                contentParts.add(text)
             }
+        }
 
-            val fullContent = contentParts.joinToString("\n")
-            if (fullContent.isBlank()) continue
+        val fullContent = contentParts.joinToString("\n")
+        if (fullContent.isBlank()) continue
 
-            when (role) {
-                "user" -> user(fullContent)
-                "assistant" -> assistant(fullContent)
-                else -> {
-                    // Skip unknown roles
-                }
-            }
+        // Only add user messages to the request list
+        // Assistant messages come from LLM responses, not manual creation
+        if (role == "user") {
+            messages.add(Message.User(content = fullContent, metaInfo = RequestMetaInfo.Empty))
         }
     }
 
-    val model = pickModel(modelName)
-
-    // Create tool registry with built-in tools
-    val toolRegistry = ToolRegistry {
-        // File operations with ReadOnly provider for safety
-        tool(ReadFileTool(JVMFileSystemProvider.ReadOnly))
-        tool(ListDirectoryTool(JVMFileSystemProvider.ReadOnly))
-        tool(EditFileTool(JVMFileSystemProvider.ReadWrite))
-    }
-
-    // Execute streaming with Koog built-in tools
-    try {
-        val stream = client.executeStreaming(
-            prompt = prompt,
-            model = model,
-            tools = toolRegistry.tools.map { it.descriptor }
-        )
-
-        stream.collect { frame ->
-            when (frame) {
-                is StreamFrame.Append -> {
-                    // Both Message.Assistant and Message.Reasoning map to StreamFrame.Append,
-                    // so we can't distinguish them at this level. Treat all as content.
-                    if (frame.text.isNotEmpty()) {
-                        sendChunk("content", frame.text, packer)
-                    }
-                }
-
-                is StreamFrame.ToolCall -> {
-                    // Tool call with id, tool name, and arguments (as content)
-                    // Send as structured data to Lua
-                    sendToolCall(frame.id, frame.name, frame.content, packer)
-                }
-
-                is StreamFrame.End -> {
-                    // End of stream
-                }
-            }
-        }
-    } catch (e: Exception) {
-        sendError("Streaming failed: ${e.message}", packer)
+    if (messages.isEmpty()) {
+        sendError("No valid messages in input", packer)
         return
     }
 
-    sendComplete(packer)
+    // Create tool registry with custom path-resolving file tools
+    val toolRegistry = ToolRegistry {
+        tool(CustomReadFileTool(JVMFileSystemProvider.ReadOnly, cwd))
+        tool(CustomListDirectoryTool<java.nio.file.Path>(cwd)) // Uses ripgrep, doesn't need FS provider
+        tool(CustomEditFileTool(JVMFileSystemProvider.ReadWrite, cwd))
+    }
+
+    // Pick model
+    val model = pickModel(modelName)
+
+    // Create agent with event handlers for RPC integration
+    val agent = AIAgent(
+        promptExecutor = simpleOpenAIExecutor(finalApiKey),
+        strategy = streamingWithToolsStrategy(),
+        llmModel = model,
+        systemPrompt = systemPrompt,
+        toolRegistry = toolRegistry,
+        installFeatures = {
+            handleEvents {
+                onLLMStreamingFrameReceived { context ->
+                    val frame = context.streamFrame
+                    when (frame) {
+                        is StreamFrame.Append -> {
+                            if (frame.text.isNotEmpty()) {
+                                sendChunk("content", frame.text, packer)
+                            }
+                        }
+
+                        is StreamFrame.ToolCall -> {
+                            // Tool call streaming - send to Lua
+                            sendToolCall(frame.id, frame.name, frame.content, packer)
+                        }
+
+                        is StreamFrame.End -> {
+                            // End of stream chunk
+                        }
+                    }
+                }
+
+                onLLMStreamingCompleted {
+                    // Stream completed successfully
+                }
+
+                onLLMStreamingFailed { context ->
+                    sendError("Streaming failed: ${context.error.message}", packer)
+                }
+            }
+        }
+    )
+
+    // Run the agent
+    try {
+        agent.run(messages)
+        sendComplete(packer)
+    } catch (e: Exception) {
+        sendError("Agent execution failed: ${e.message}", packer)
+    }
 }
 
 // --- RPC Sending Helpers ---

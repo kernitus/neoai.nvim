@@ -237,6 +237,7 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     api_key_format = conf.api_key_format or "Bearer %s",
     model = conf.model,
     body = payload_tbl,
+    cwd = vim.fn.getcwd(),
   }
 
   local client = api.get_client()
