@@ -14,14 +14,6 @@ import ai.koog.agents.ext.tool.file.ReadFileTool
 import ai.koog.agents.ext.tool.file.EditFileTool
 import ai.koog.agents.ext.tool.file.ListDirectoryTool
 import ai.koog.agents.core.tools.ToolRegistry
-import ai.koog.agents.core.agent.AIAgent
-import ai.koog.agents.core.feature.handler.agent.AgentEventHandler
-import ai.koog.agents.core.feature.model.events.LLMCallStartingEvent
-import ai.koog.agents.core.feature.model.events.LLMCallChunkEvent
-import ai.koog.agents.core.feature.model.events.LLMCallEndEvent
-import ai.koog.agents.core.feature.handler.agent.tool.ToolCallStartEvent
-import ai.koog.agents.core.feature.handler.agent.tool.ToolCallEndEvent
-import ai.koog.prompt.executor.simpleOpenAIExecutor
 import kotlinx.coroutines.*
 import ai.koog.rag.base.files.JVMFileSystemProvider
 import org.msgpack.core.MessagePack
@@ -405,57 +397,43 @@ suspend fun generate(
 
     // Create tool registry with built-in tools
     val toolRegistry = ToolRegistry {
+        // File operations with ReadOnly provider for safety
         tool(ReadFileTool(JVMFileSystemProvider.ReadOnly))
         tool(ListDirectoryTool(JVMFileSystemProvider.ReadOnly))
         tool(EditFileTool(JVMFileSystemProvider.ReadWrite))
     }
 
-    // Create event handler for streaming responses to Lua
-    val eventHandler = object : AgentEventHandler() {
-        override suspend fun onLLMCallChunk(event: LLMCallChunkEvent) {
-            // Stream LLM output chunks
-            if (event.chunk.isNotEmpty()) {
-                sendChunk("content", event.chunk, packer)
+    // Execute streaming with Koog built-in tools
+    try {
+        val stream = client.executeStreaming(
+            prompt = prompt,
+            model = model,
+            tools = toolRegistry.tools.map { it.descriptor }
+        )
+
+        stream.collect { frame ->
+            when (frame) {
+                is StreamFrame.Append -> {
+                    // Both Message.Assistant and Message.Reasoning map to StreamFrame.Append,
+                    // so we can't distinguish them at this level. Treat all as content.
+                    if (frame.text.isNotEmpty()) {
+                        sendChunk("content", frame.text, packer)
+                    }
+                }
+
+                is StreamFrame.ToolCall -> {
+                    // Tool call with id, tool name, and arguments (as content)
+                    // Send as structured data to Lua
+                    sendToolCall(frame.id, frame.name, frame.content, packer)
+                }
+
+                is StreamFrame.End -> {
+                    // End of stream
+                }
             }
         }
-
-        override suspend fun onToolCallStart(event: ToolCallStartEvent) {
-            // Notify that a tool is being called
-            sendChunk("tool_call_start", "Calling ${event.toolName}...", packer)
-        }
-
-        override suspend fun onToolCallEnd(event: ToolCallEndEvent) {
-            // Send tool results
-            val result = event.result?.toString() ?: "No result"
-            sendChunk("tool_result", "[${event.toolName}]: $result", packer)
-        }
-    }
-
-    // Create AIAgent with tools and streaming support
-    try {
-        val baseUrl = url.substringBefore("/v1")
-        val executor = simpleOpenAIExecutor(
-            apiKey = finalApiKey,
-            baseUrl = baseUrl
-        )
-
-        val agent = AIAgent(
-            promptExecutor = executor,
-            llmModel = model,
-            systemPrompt = systemPrompt,
-            toolRegistry = toolRegistry,
-            maxIterations = 20,
-            eventHandler = eventHandler
-        )
-
-        // Extract the last user message for agent input
-        val userInput = extractLastUserText(body) ?: "Continue the conversation"
-
-        // Run the agent - it will automatically execute tools and stream responses
-        agent.run(userInput)
-
     } catch (e: Exception) {
-        sendError("Agent execution failed: ${e.message}", packer)
+        sendError("Streaming failed: ${e.message}", packer)
         return
     }
 
