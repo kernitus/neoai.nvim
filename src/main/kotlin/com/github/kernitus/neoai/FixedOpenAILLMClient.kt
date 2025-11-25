@@ -8,6 +8,7 @@ import ai.koog.prompt.executor.clients.openai.OpenAIResponsesParams
 import ai.koog.prompt.llm.LLModel
 import ai.koog.prompt.message.Message
 import ai.koog.prompt.message.ResponseMetaInfo
+import ai.koog.prompt.params.LLMParams
 import ai.koog.prompt.streaming.StreamFrame
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.DefaultRequest
@@ -33,7 +34,6 @@ import kotlinx.serialization.json.JsonObject
 class FixedOpenAILLMClient(
     apiKey: String,
     private val settings: OpenAIClientSettings,
-    // encodeDefaults = false removes null fields from the JSON output
     private val responseJson: Json = Json { ignoreUnknownKeys = true; encodeDefaults = false }
 ) : OpenAILLMClient(apiKey, settings) {
 
@@ -68,7 +68,7 @@ class FixedOpenAILLMClient(
                 )
             }
 
-            // 2. Map Messages to Input Items
+            // 2. Map Messages
             val inputItems: List<FixedItem> = prompt.messages.mapNotNull { msg ->
                 when (msg) {
                     is Message.System -> FixedItem(
@@ -112,6 +112,15 @@ class FixedOpenAILLMClient(
                 input = inputItems,
                 tools = apiTools,
                 stream = true,
+                toolChoice = when (params.toolChoice) {
+                    LLMParams.ToolChoice.Auto -> "auto"
+                    LLMParams.ToolChoice.None -> "none"
+                    LLMParams.ToolChoice.Required -> "required"
+                    // Note: Named tool choice requires a specific object structure, defaulting to auto for simplicity here
+                    // unless you specifically need to force a named tool.
+                    else -> null
+                },
+                maxOutputTokens = params.maxTokens,
                 reasoning = params.reasoning?.let {
                     FixedReasoning(
                         effort = it.effort?.name?.lowercase() ?: "medium"
@@ -122,14 +131,10 @@ class FixedOpenAILLMClient(
             val requestBody = responseJson.encodeToString(request)
 
             // 4. Execute Request
-            // Fix URL construction to avoid double paths (e.g. /v1/v1/responses)
             var urlStr = settings.baseUrl.trimEnd('/')
             val path = settings.responsesAPIPath
 
-            // If the baseUrl already ends with the path (common in custom configs), use it as is.
-            // Otherwise, append the path intelligently.
             if (!urlStr.endsWith(path)) {
-                // If baseUrl ends in /v1 and path starts with v1/, strip one to avoid duplication
                 if (urlStr.endsWith("/v1") && path.startsWith("v1/")) {
                     urlStr = urlStr.removeSuffix("/v1")
                 }
@@ -190,6 +195,8 @@ class FixedOpenAILLMClient(
         val input: List<FixedItem>,
         val tools: List<FixedTool>,
         val stream: Boolean,
+        @SerialName("tool_choice") val toolChoice: String? = null,
+        @SerialName("max_output_tokens") val maxOutputTokens: Int? = null,
         val reasoning: FixedReasoning? = null
     )
 
