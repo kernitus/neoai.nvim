@@ -1,13 +1,15 @@
 package com.github.kernitus.neoai
 
+import ai.koog.prompt.params.LLMParams.ToolChoice
+
 import ai.koog.prompt.dsl.prompt
 import ai.koog.prompt.executor.clients.openai.OpenAIClientSettings
-import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
 import ai.koog.prompt.executor.clients.openai.OpenAIModels
 import ai.koog.prompt.executor.clients.openai.OpenAIResponsesParams
 import ai.koog.prompt.executor.clients.openai.base.models.ReasoningEffort
 import ai.koog.prompt.executor.clients.openai.models.ReasoningConfig
 import ai.koog.prompt.executor.clients.openai.models.ReasoningSummary
+import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
 import ai.koog.prompt.message.Message
 import ai.koog.prompt.message.RequestMetaInfo
 import com.github.kernitus.neoai.ai_tools.CustomReadFileTool
@@ -15,6 +17,7 @@ import com.github.kernitus.neoai.ai_tools.CustomListDirectoryTool
 import com.github.kernitus.neoai.ai_tools.CustomEditFileTool
 import ai.koog.prompt.streaming.StreamFrame
 import ai.koog.agents.core.tools.ToolRegistry
+import ai.koog.prompt.llm.LLMProvider
 import ai.koog.agents.core.agent.AIAgent
 import ai.koog.agents.core.agent.GraphAIAgent.FeatureContext
 import ai.koog.agents.core.dsl.builder.forwardTo
@@ -36,6 +39,10 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import ai.koog.prompt.params.LLMParams
+import ai.koog.prompt.streaming.toMessageResponses
+import kotlinx.coroutines.flow.toList
+import ai.koog.prompt.executor.clients.openai.OpenAIChatParams
 
 // Define the scope for background tasks
 // Dispatchers.IO is best for network requests; SupervisorJob prevents one crash from killing the whole scope
@@ -156,49 +163,68 @@ private fun formatToolsForPrompt(toolsVal: org.msgpack.value.Value?): String {
 
 // --- Strategy for Streaming with Tools ---
 
-private fun streamingWithToolsStrategy() = strategy<List<Message.Request>, String>("streaming_loop") {
-    val executeMultipleTools by nodeExecuteMultipleTools(parallelTools = true)
-    val nodeStreaming by nodeLLMRequestStreamingAndSendResults<List<Message.Request>>()
+// 1. Accept params argument
+private fun streamingWithToolsStrategy(customParams: LLMParams?) =
+    strategy<List<Message.Request>, String>("streaming_loop") {
+        val executeMultipleTools by nodeExecuteMultipleTools(parallelTools = true)
 
-    val applyRequestToSession by node<List<Message.Request>, List<Message.Request>> { input ->
-        llm.writeSession {
-            appendPrompt {
-                input.filterIsInstance<Message.User>()
-                    .forEach {
-                        user(it.content)
-                    }
-
-                tool {
-                    input.filterIsInstance<Message.Tool.Result>()
-                        .forEach {
-                            result(it)
-                        }
+        // 2. Define custom node manually instead of using nodeLLMRequestStreamingAndSendResults
+        val nodeStreaming by node<List<Message.Request>, List<Message.Response>> { input ->
+            llm.writeSession {
+                // 3. Inject the parameters if they exist
+                if (customParams != null) {
+                    changeLLMParams(customParams)
                 }
+
+                // 4. Execute streaming (logic copied from the standard extension)
+                requestLLMStreaming()
+                    .toList()
+                    .toMessageResponses()
+                    .also { responses ->
+                        // Update history with the assistant's response
+                        appendPrompt { messages(responses) }
+                    }
             }
-            input
         }
-    }
 
-    val mapToolCallsToRequests by node<List<ReceivedToolResult>, List<Message.Request>> { input ->
-        input.map { it.toMessage() }
-    }
+        val applyRequestToSession by node<List<Message.Request>, List<Message.Request>> { input ->
+            llm.writeSession {
+                appendPrompt {
+                    input.filterIsInstance<Message.User>()
+                        .forEach {
+                            user(it.content)
+                        }
 
-    // Define edges
-    edge(nodeStart forwardTo applyRequestToSession)
-    edge(applyRequestToSession forwardTo nodeStreaming)
-    edge(nodeStreaming forwardTo executeMultipleTools onMultipleToolCalls { true })
-    edge(executeMultipleTools forwardTo mapToolCallsToRequests)
-    edge(mapToolCallsToRequests forwardTo applyRequestToSession)
-    edge(
-        nodeStreaming forwardTo nodeFinish onCondition {
-            it.filterIsInstance<Message.Tool.Call>().isEmpty()
-        } transformed {
-            // Extract assistant message content
-            it.filterIsInstance<Message.Assistant>()
-                .firstOrNull()?.content ?: ""
+                    tool {
+                        input.filterIsInstance<Message.Tool.Result>()
+                            .forEach {
+                                result(it)
+                            }
+                    }
+                }
+                input
+            }
         }
-    )
-}
+
+        val mapToolCallsToRequests by node<List<ReceivedToolResult>, List<Message.Request>> { input ->
+            input.map { it.toMessage() }
+        }
+
+        // Define edges
+        edge(nodeStart forwardTo applyRequestToSession)
+        edge(applyRequestToSession forwardTo nodeStreaming)
+        edge(nodeStreaming forwardTo executeMultipleTools onMultipleToolCalls { true })
+        edge(executeMultipleTools forwardTo mapToolCallsToRequests)
+        edge(mapToolCallsToRequests forwardTo applyRequestToSession)
+        edge(
+            nodeStreaming forwardTo nodeFinish onCondition {
+                it.filterIsInstance<Message.Tool.Call>().isEmpty()
+            } transformed {
+                it.filterIsInstance<Message.Assistant>()
+                    .firstOrNull()?.content ?: ""
+            }
+        )
+    }
 
 // --- Main ---
 
@@ -255,12 +281,8 @@ fun main() = runBlocking {
 
 fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker) {
     if (method == "generate") {
-        // params is [ { ... } ]
         if (paramsArray.size() > 0) {
-            val paramValue = paramsArray[0].toString()
-
             try {
-                // Decode manually from the MapValue
                 val paramValue = paramsArray[0]
                 if (!paramValue.isMapValue) {
                     sendError("Params must be a map", packer)
@@ -281,6 +303,35 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
                 val model = getStr("model")
                 val cwd = getStr("cwd", System.getProperty("user.dir") ?: ".")
 
+                // --- Parsing Reasoning Effort (Nested) ---
+                var reasoningEffort: String? = null
+
+                // 1. Check for flat key first (backward compatibility)
+                val flatEffort = getStr("reasoning_effort")
+                if (flatEffort.isNotBlank()) {
+                    reasoningEffort = flatEffort
+                }
+
+                // 2. Check nested: additional_kwargs -> reasoning -> effort
+                val kwargsKey = org.msgpack.value.ValueFactory.newString("additional_kwargs")
+                val kwargsVal = mapData[kwargsKey]
+
+                if (kwargsVal != null && kwargsVal.isMapValue) {
+                    val kwargsMap = kwargsVal.asMapValue().map()
+                    val reasoningKey = org.msgpack.value.ValueFactory.newString("reasoning")
+                    val reasoningVal = kwargsMap[reasoningKey]
+
+                    if (reasoningVal != null && reasoningVal.isMapValue) {
+                        val rMap = reasoningVal.asMapValue().map()
+                        val effortKey = org.msgpack.value.ValueFactory.newString("effort")
+                        val effortVal = rMap[effortKey]
+
+                        if (effortVal != null && effortVal.isStringValue) {
+                            reasoningEffort = effortVal.asStringValue().asString()
+                        }
+                    }
+                }
+
                 val bodyKey = org.msgpack.value.ValueFactory.newString("body")
                 val body = mapData[bodyKey]
 
@@ -289,36 +340,30 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
                     return
                 }
 
-                // 2. Launch in background
                 scope.launch {
                     try {
-                        generate(url, apiKey, model, body, cwd, packer)
+                        generate(url, apiKey, model, reasoningEffort, body, cwd, packer)
                     } catch (e: Exception) {
-                        // 3. Handle generation errors inside the coroutine
                         sendError("Generation failed: ${e.message}", packer)
                     }
                 }
             } catch (e: Exception) {
-                // Handle parsing errors
                 sendError("Invalid params: ${e.message}", packer)
             }
         }
-    } else {
-        // Ignore unknown methods
     }
 }
-
-// --- Generation Logic ---
 
 suspend fun generate(
     url: String,
     apiKey: String,
     modelName: String,
+    reasoningEffort: String?,
     body: org.msgpack.value.Value,
     cwd: String,
     packer: MessagePacker
 ) {
-    // Prefer envelope API key; otherwise fall back to OPENAI_API_KEY.
+    // 1. API Key Logic
     val finalApiKey = apiKey.ifBlank {
         System.getenv("OPENAI_API_KEY") ?: ""
     }
@@ -328,6 +373,7 @@ suspend fun generate(
         return
     }
 
+    // 2. Body Parsing
     if (!body.isMapValue) {
         sendError("Body must be a map/object", packer)
         return
@@ -335,36 +381,32 @@ suspend fun generate(
 
     val bodyMap = body.asMapValue().map()
 
-    // Helper to get value from map
     fun getValue(key: String): org.msgpack.value.Value? {
         val k = org.msgpack.value.ValueFactory.newString(key)
         return bodyMap[k]
     }
 
-    // Extract input (array of messages)
     val inputVal = getValue("input")
     if (inputVal == null || !inputVal.isArrayValue) {
         sendError("Missing or invalid 'input' field", packer)
         return
     }
 
-    // Extract tools array (for system prompt template)
     val toolsVal = getValue("tools")
 
-    // Read system prompt from file
+    // 3. System Prompt
     val systemPromptFile = java.io.File("lua/neoai/prompts/system_prompt.md")
     val systemPrompt = if (systemPromptFile.exists()) {
         val content = systemPromptFile.readText()
-        // Replace template variables
         val toolsFormatted = formatToolsForPrompt(toolsVal)
         content
             .replace("%tools", toolsFormatted)
-            .replace("%agents", "") // TODO: Read AGENTS.md if exists
+            .replace("%agents", "")
     } else {
         "You are a helpful AI assistant running inside NeoVim."
     }
 
-    // Convert msgpack input to Koog Message.Request format
+    // 4. Message Parsing
     val messages = mutableListOf<Message.Request>()
     val inputArray = inputVal.asArrayValue()
     for (i in 0 until inputArray.size()) {
@@ -383,7 +425,6 @@ suspend fun generate(
 
         val role = getItemString("role") ?: continue
 
-        // Extract content from the message
         val contentKey = org.msgpack.value.ValueFactory.newString("content")
         val contentVal = itemMap[contentKey]
         if (contentVal == null || !contentVal.isArrayValue) continue
@@ -411,8 +452,6 @@ suspend fun generate(
         val fullContent = contentParts.joinToString("\n")
         if (fullContent.isBlank()) continue
 
-        // Only add user messages to the request list
-        // Assistant messages come from LLM responses, not manual creation
         if (role == "user") {
             messages.add(Message.User(content = fullContent, metaInfo = RequestMetaInfo.Empty))
         }
@@ -423,28 +462,57 @@ suspend fun generate(
         return
     }
 
-    // Create tool registry with custom path-resolving file tools
+    // 5. Tool Registry
     val toolRegistry = ToolRegistry {
         tool(CustomReadFileTool(JVMFileSystemProvider.ReadOnly, cwd))
-        tool(CustomListDirectoryTool<java.nio.file.Path>(cwd)) // Uses ripgrep, doesn't need FS provider
+        tool(CustomListDirectoryTool<java.nio.file.Path>(cwd))
         tool(CustomEditFileTool(JVMFileSystemProvider.ReadWrite, cwd))
     }
 
-    // Pick model
+    // 6. Pick Model
     val model = pickModel(modelName)
 
-    // Create agent with event handlers for RPC integration
+    // 7. Configure Client Settings (URL)
+    // We pass the URL to the settings, NOT the API key.
+    val clientSettings = if (url.isNotBlank()) {
+        OpenAIClientSettings(baseUrl = url)
+    } else {
+        OpenAIClientSettings()
+    }
+
+    // 8. Initialize Client
+    // We pass the API key and the settings here.
+    val openAIClient = FixedOpenAILLMClient(apiKey = finalApiKey, settings = clientSettings)
+
+    val executor = MultiLLMPromptExecutor(LLMProvider.OpenAI to openAIClient)
+
+    val reasoningParams = if (isReasoningModel(modelName)) {
+        val effort = when (reasoningEffort?.lowercase()) {
+            "low", "minimal" -> ReasoningEffort.LOW
+            "high" -> ReasoningEffort.HIGH
+            else -> ReasoningEffort.MEDIUM
+        }
+
+        // USE THIS for /v1/responses and nested {"reasoning": {"effort": "..."}}
+        OpenAIResponsesParams(
+            reasoning = ReasoningConfig(effort = effort),
+            toolChoice = ToolChoice.Auto
+        )
+    } else {
+        null
+    }
+
+    // 10. Create Agent
     val agent = AIAgent(
-        promptExecutor = simpleOpenAIExecutor(finalApiKey),
-        strategy = streamingWithToolsStrategy(),
+        promptExecutor = executor,
+        strategy = streamingWithToolsStrategy(reasoningParams),
         llmModel = model,
         systemPrompt = systemPrompt,
         toolRegistry = toolRegistry,
         installFeatures = {
             handleEvents {
                 onLLMStreamingFrameReceived { context ->
-                    val frame = context.streamFrame
-                    when (frame) {
+                    when (val frame = context.streamFrame) {
                         is StreamFrame.Append -> {
                             if (frame.text.isNotEmpty()) {
                                 sendChunk("content", frame.text, packer)
@@ -452,20 +520,12 @@ suspend fun generate(
                         }
 
                         is StreamFrame.ToolCall -> {
-                            // Tool call streaming - send to Lua
                             sendToolCall(frame.id, frame.name, frame.content, packer)
                         }
 
-                        is StreamFrame.End -> {
-                            // End of stream chunk
-                        }
+                        is StreamFrame.End -> {}
                     }
                 }
-
-                onLLMStreamingCompleted {
-                    // Stream completed successfully
-                }
-
                 onLLMStreamingFailed { context ->
                     sendError("Streaming failed: ${context.error.message}", packer)
                 }
@@ -473,7 +533,7 @@ suspend fun generate(
         }
     )
 
-    // Run the agent
+    // 11. Run
     try {
         agent.run(messages)
         sendComplete(packer)
@@ -482,7 +542,6 @@ suspend fun generate(
     }
 }
 
-// --- RPC Sending Helpers ---
 
 fun sendChunk(type: String, data: String, packer: MessagePacker) {
     synchronized(packer) {

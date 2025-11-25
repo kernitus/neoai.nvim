@@ -57,6 +57,8 @@ luac.out
 
 # Package Files #
 *.jar
+# Don't ignore gradle wrapper jar
+!gradle/wrapper/gradle-wrapper.jar
 *.war
 *.nar
 *.ear

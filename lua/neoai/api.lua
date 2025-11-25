@@ -47,7 +47,7 @@ function DaemonClient:start()
   end
 
   log("DaemonClient: starting java -jar %s", jar)
-  
+
   self.job_id = vim.fn.jobstart({ "java", "-jar", jar }, {
     rpc = true,
     on_exit = function(_, code, _)
@@ -98,8 +98,12 @@ end
 
 local function merge_tables(t1, t2)
   local result = {}
-  for k, v in pairs(t1 or {}) do result[k] = v end
-  for k, v in pairs(t2 or {}) do result[k] = v end
+  for k, v in pairs(t1 or {}) do
+    result[k] = v
+  end
+  for k, v in pairs(t2 or {}) do
+    result[k] = v
+  end
   return result
 end
 
@@ -124,7 +128,9 @@ end
 
 local function merge_native_tools(base, native)
   if type(native) == "table" then
-    for _, t in ipairs(native) do table.insert(base, t) end
+    for _, t in ipairs(native) do
+      table.insert(base, t)
+    end
   end
   return base
 end
@@ -139,7 +145,9 @@ local function chat_messages_to_items(messages)
   local instructions_parts = {}
 
   local function add_instructions(s)
-    if s and s ~= "" then table.insert(instructions_parts, s) end
+    if s and s ~= "" then
+      table.insert(instructions_parts, s)
+    end
   end
 
   for _, m in ipairs(messages or {}) do
@@ -236,6 +244,10 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     api_key_header = conf.api_key_header or "Authorization",
     api_key_format = conf.api_key_format or "Bearer %s",
     model = conf.model,
+
+    -- ✅ ADDED THIS LINE: Forward additional_kwargs to the envelope
+    additional_kwargs = conf.additional_kwargs,
+
     body = payload_tbl,
     cwd = vim.fn.getcwd(),
   }
@@ -244,7 +256,9 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
   -- Send notification: "generate" with [envelope]
   -- Note: rpcnotify params must be a list/array.
   if not client:notify("generate", envelope) then
-    if on_error then on_error("Failed to send request to daemon") end
+    if on_error then
+      on_error("Failed to send request to daemon")
+    end
     current_callbacks = nil
   end
 end
@@ -256,7 +270,7 @@ function api.cancel()
     end
     current_callbacks = nil
   end
-  -- Optionally notify daemon to cancel? 
+  -- Optionally notify daemon to cancel?
   -- client:notify("cancel", {})
 end
 
@@ -265,7 +279,7 @@ end
 function _G.NeoAI_OnChunk(chunk)
   -- chunk is a table: { type="...", data="..." }
   log("NeoAI_OnChunk: %s", vim.inspect(chunk))
-  
+
   if not current_callbacks then
     return
   end
@@ -278,7 +292,7 @@ function _G.NeoAI_OnChunk(chunk)
       -- Schedule to ensure main thread safety if needed (rpc calls are usually safe but...)
       vim.schedule(function()
         if current_callbacks then
-            current_callbacks.on_chunk({ type = t, data = d })
+          current_callbacks.on_chunk({ type = t, data = d })
         end
       end)
     end
@@ -286,8 +300,8 @@ function _G.NeoAI_OnChunk(chunk)
     if current_callbacks.on_complete then
       vim.schedule(function()
         if current_callbacks then
-            current_callbacks.on_complete()
-            current_callbacks = nil
+          current_callbacks.on_complete()
+          current_callbacks = nil
         end
       end)
     end
@@ -295,8 +309,8 @@ function _G.NeoAI_OnChunk(chunk)
     if current_callbacks.on_error then
       vim.schedule(function()
         if current_callbacks then
-            current_callbacks.on_error(d)
-            current_callbacks = nil
+          current_callbacks.on_error(d)
+          current_callbacks = nil
         end
       end)
     end

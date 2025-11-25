@@ -173,7 +173,9 @@ config.defaults = {
           max_output_tokens = 128000,
           additional_kwargs = {
             temperature = 1,
-            reasoning_effort = "medium",
+            reasoning = {
+              effort = "medium",
+            },
           },
         },
         small = {
@@ -183,7 +185,9 @@ config.defaults = {
           max_output_tokens = 128000,
           additional_kwargs = {
             temperature = 1,
-            reasoning_effort = "minimal",
+            reasoning = {
+              effort = "low",
+            },
           },
         },
       },
