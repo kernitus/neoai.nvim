@@ -4,6 +4,19 @@ local log = require("neoai.debug").log
 
 local api = {}
 
+function api.get_plugin_root()
+  local info = debug.getinfo(1, "S")
+  local source = info.source
+  if source:sub(1, 1) == "@" then
+    source = source:sub(2)
+  end
+  -- Source is .../lua/neoai/api.lua
+  -- :h -> .../lua/neoai
+  -- :h:h -> .../lua
+  -- :h:h:h -> .../ (Plugin Root)
+  return vim.fn.fnamemodify(source, ":h:h:h")
+end
+
 -- --- Daemon Client ---
 
 local DaemonClient = {}
@@ -238,6 +251,9 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
   }
 
   local payload_tbl = build_payload(messages)
+
+  local root = api.get_plugin_root()
+
   local envelope = {
     url = conf.url,
     api_key = conf.api_key,
@@ -245,8 +261,8 @@ function api.stream(messages, on_chunk, on_complete, on_error, on_cancel)
     api_key_format = conf.api_key_format or "Bearer %s",
     model = conf.model,
 
-    -- ✅ ADDED THIS LINE: Forward additional_kwargs to the envelope
     additional_kwargs = conf.additional_kwargs,
+    plugin_root = root,
 
     body = payload_tbl,
     cwd = vim.fn.getcwd(),

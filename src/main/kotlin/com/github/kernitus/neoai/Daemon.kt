@@ -302,6 +302,7 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
                 val apiKey = getStr("api_key")
                 val model = getStr("model")
                 val cwd = getStr("cwd", System.getProperty("user.dir") ?: ".")
+                val pluginRoot = getStr("plugin_root")
 
                 // --- Parsing Reasoning Effort (Nested) ---
                 var reasoningEffort: String? = null
@@ -342,7 +343,7 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
 
                 scope.launch {
                     try {
-                        generate(url, apiKey, model, reasoningEffort, body, cwd, packer)
+                        generate(url, apiKey, model, reasoningEffort, body, cwd, pluginRoot, packer)
                     } catch (e: Exception) {
                         sendError("Generation failed: ${e.message}", packer)
                     }
@@ -361,6 +362,7 @@ suspend fun generate(
     reasoningEffort: String?,
     body: org.msgpack.value.Value,
     cwd: String,
+    pluginRoot: String,
     packer: MessagePacker
 ) {
     // 1. API Key Logic
@@ -394,16 +396,23 @@ suspend fun generate(
 
     val toolsVal = getValue("tools")
 
-    // 3. System Prompt
-    val systemPromptFile = java.io.File("lua/neoai/prompts/system_prompt.md")
-    val systemPrompt = if (systemPromptFile.exists()) {
+    // Construct the full path: pluginRoot + relative path
+    val systemPromptFile = java.io.File(pluginRoot, "lua/neoai/prompts/system_prompt.md")
+
+    if (!systemPromptFile.exists()) {
+        sendError("System prompt file not found at: ${systemPromptFile.absolutePath}", packer)
+        return
+    }
+
+    val systemPrompt = try {
         val content = systemPromptFile.readText()
         val toolsFormatted = formatToolsForPrompt(toolsVal)
         content
             .replace("%tools", toolsFormatted)
             .replace("%agents", "")
-    } else {
-        "You are a helpful AI assistant running inside NeoVim."
+    } catch (e: Exception) {
+        sendError("Failed to read system prompt file: ${e.message}", packer)
+        return
     }
 
     // 4. Message Parsing
