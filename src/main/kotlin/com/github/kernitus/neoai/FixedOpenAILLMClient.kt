@@ -32,6 +32,7 @@ import kotlinx.serialization.json.JsonObject
 class FixedOpenAILLMClient(
     apiKey: String,
     private val settings: OpenAIClientSettings,
+    // ✅ CRITICAL: ignoreUnknownKeys must be true to handle 'sequence_number' and other new fields
     private val responseJson: Json =
         Json {
             ignoreUnknownKeys = true
@@ -58,7 +59,6 @@ class FixedOpenAILLMClient(
         }
 
         return flow {
-            // ... 1. Map Tools (Same as before) ...
             val apiTools =
                 tools.map { tool ->
                     FixedTool(
@@ -69,7 +69,6 @@ class FixedOpenAILLMClient(
                     )
                 }
 
-            // ... 2. Map Messages (Same as before) ...
             val inputItems: List<FixedItem> =
                 prompt.messages.mapNotNull { msg ->
                     when (msg) {
@@ -120,27 +119,26 @@ class FixedOpenAILLMClient(
                     }
                 }
 
-                        val request = FixedRequest(
-                model = model.id,
-                input = inputItems,
-                tools = apiTools,
-                stream = true,
-                toolChoice = "auto",
-                maxOutputTokens = params.maxTokens,
-                reasoning = params.reasoning?.let {
-                    FixedReasoning(
-                        effort = it.effort?.name?.lowercase() ?: "medium",
-                        summary = "auto" 
-                    )
-                }
-            )
+            val request =
+                FixedRequest(
+                    model = model.id,
+                    input = inputItems,
+                    tools = apiTools,
+                    stream = true,
+                    toolChoice = "auto",
+                    maxOutputTokens = params.maxTokens,
+                    reasoning =
+                        params.reasoning?.let {
+                            FixedReasoning(
+                                effort = it.effort?.name?.lowercase() ?: "medium",
+                                summary = "auto",
+                            )
+                        },
+                )
 
             val requestBody = responseJson.encodeToString(request)
+            // DebugLogger.log(">>> REQUEST: $requestBody")
 
-            // LOG REQUEST
-            DebugLogger.log(">>> REQUEST: $requestBody")
-
-            // 4. Execute Request
             var urlStr = settings.baseUrl.trimEnd('/')
             if (!urlStr.endsWith("/responses") && !urlStr.contains("responses")) {
                 urlStr = "$urlStr/responses"
@@ -168,18 +166,39 @@ class FixedOpenAILLMClient(
                                 try {
                                     // LOG RAW EVENT
                                     DebugLogger.log("<<< EVENT: $data")
-
                                     val event = responseJson.decodeFromString<FixedStreamEvent>(data)
 
                                     when (event.type) {
+                                        // 1. Standard Content
                                         "response.output_text.delta" -> {
                                             if (event.delta != null) {
                                                 emit(StreamFrame.Append(event.delta))
                                             }
                                         }
 
+                                        // 2. Reasoning Summary (The part you want!)
+                                        "response.reasoning_summary_text.delta" -> {
+                                            if (event.delta != null) {
+                                                emit(StreamFrame.Append(event.delta))
+                                            }
+                                        }
+
+                                        // 3. Reasoning Start Indicator
+                                        "response.output_item.added" -> {
+                                            val item = event.item
+                                            if (item != null && item.type == "reasoning") {
+                                                emit(StreamFrame.Append("\n> **Thinking...**\n> "))
+                                            }
+                                        }
+
+                                        // 4. Reasoning End Indicator
                                         "response.output_item.done" -> {
                                             val item = event.item
+                                            if (item != null && item.type == "reasoning") {
+                                                // Close the blockquote
+                                                emit(StreamFrame.Append("\n\n"))
+                                            }
+                                            // Tool Calls
                                             if (item != null && item.type == "function_call") {
                                                 DebugLogger.log("<<< TOOL CALL DETECTED: ${item.name}")
                                                 emit(
@@ -197,7 +216,7 @@ class FixedOpenAILLMClient(
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    DebugLogger.log("!!! PARSE ERROR: ${e.message}")
+                                    DebugLogger.log("!!! PARSE ERROR: ${e.message} | DATA: $data")
                                 }
                             }
                         }
@@ -220,10 +239,10 @@ class FixedOpenAILLMClient(
     )
 
     @Serializable
-private data class FixedReasoning(
-    val effort: String,
-    val summary: String? = null // Add this field
-)
+    private data class FixedReasoning(
+        val effort: String,
+        val summary: String? = null,
+    )
 
     @Serializable
     private data class FixedItem(
@@ -253,6 +272,7 @@ private data class FixedReasoning(
     @Serializable
     private data class FixedStreamEvent(
         val type: String,
+        // This 'delta' field captures text from both output_text.delta AND reasoning_summary_text.delta
         val delta: String? = null,
         val item: FixedItem? = null,
     )
