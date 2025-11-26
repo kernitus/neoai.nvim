@@ -114,6 +114,10 @@ end
 -- Thinking animation (spinner) helpers
 local thinking_ns = vim.api.nvim_create_namespace("NeoAIThinking")
 
+-- Overlays for tool status and reasoning summary
+local tool_status_ns = vim.api.nvim_create_namespace("NeoAIToolStatus")
+local reasoning_ns = vim.api.nvim_create_namespace("NeoAIReasoning")
+
 -- Redraw any windows that are currently showing the chat buffer, without stealing focus
 local function redraw_chat_windows()
   local bufnr = chat.chat_state and chat.chat_state.buffers and chat.chat_state.buffers.chat or nil
@@ -495,6 +499,10 @@ function chat.setup()
     _empty_turn_retry_used = false, -- guard to avoid infinite retries
     _consecutive_silent_turns = 0,
     _plan_without_action_count = 0,
+    _stream_header_row = nil, -- 0-based row of the current assistant header
+    _stream_body_row = nil, -- 0-based row where streamed text begins
+    tool_status = { extmark_id = nil },
+    reasoning_status = { extmark_id = nil },
   }
 
   -- Bridge inline diff outcome to chat as a user-visible message
@@ -987,6 +995,34 @@ function chat.send_to_ai()
     table.insert(lines, "")
 
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+
+    -- Compute header/body anchors for this streaming turn
+    local total = vim.api.nvim_buf_line_count(bufnr)
+    local header_row0 = total - 2 -- 0-based index of the new header
+    local body_row0 = header_row0 + 1 -- blank line under the header
+    chat.chat_state._stream_header_row = header_row0
+    chat.chat_state._stream_body_row = body_row0
+
+    -- Reset tool status overlay
+    chat.chat_state.tool_status = chat.chat_state.tool_status or {}
+    if chat.chat_state.tool_status.extmark_id then
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, tool_status_ns, chat.chat_state.tool_status.extmark_id)
+    end
+    chat.chat_state.tool_status.extmark_id = vim.api.nvim_buf_set_extmark(bufnr, tool_status_ns, header_row0, 0, {
+      virt_lines = {},
+      virt_lines_above = false,
+    })
+
+    -- Reset reasoning summary overlay
+    chat.chat_state.reasoning_status = chat.chat_state.reasoning_status or {}
+    if chat.chat_state.reasoning_status.extmark_id then
+      pcall(vim.api.nvim_buf_del_extmark, bufnr, reasoning_ns, chat.chat_state.reasoning_status.extmark_id)
+    end
+    chat.chat_state.reasoning_status.extmark_id = vim.api.nvim_buf_set_extmark(bufnr, reasoning_ns, header_row0, 0, {
+      virt_lines = {},
+      virt_lines_above = false,
+    })
+
     if chat.chat_state.config.auto_scroll then
       scroll_to_bottom(bufnr)
     end
@@ -1060,6 +1096,156 @@ function chat.stream_ai_response(messages)
   local start_time = os.time()
   local saw_first_token = false
   local has_completed = false
+
+  -- Append raw streamed text to the current assistant body (no crawling)
+  local function append_stream_text(delta)
+    if not delta or delta == "" then
+      return
+    end
+    if not (chat.chat_state and chat.chat_state.buffers and chat.chat_state.buffers.chat) then
+      return
+    end
+    local bufnr = chat.chat_state.buffers.chat
+    if not vim.api.nvim_buf_is_valid(bufnr) then
+      return
+    end
+
+    local body_row0 = chat.chat_state._stream_body_row
+    if not body_row0 then
+      -- Fallback: infer from header if needed
+      local header = chat.chat_state._stream_header_row or find_last_assistant_header_row()
+      if not header then
+        return
+      end
+      body_row0 = header + 1
+      chat.chat_state._stream_body_row = body_row0
+    end
+
+    -- Get only the current streaming body (not the whole buffer)
+    local body_lines = vim.api.nvim_buf_get_lines(bufnr, body_row0, -1, false)
+    local existing = table.concat(body_lines, "\n")
+    local combined = existing .. delta
+    local new_lines = vim.split(combined, "\n", true)
+    vim.api.nvim_buf_set_lines(bufnr, body_row0, -1, false, new_lines)
+  end
+
+  local function update_reasoning_overlay()
+    if not (chat.chat_state and chat.chat_state.buffers and chat.chat_state.buffers.chat) then
+      return
+    end
+    local bufnr = chat.chat_state.buffers.chat
+    if not vim.api.nvim_buf_is_valid(bufnr) then
+      return
+    end
+    local rs = chat.chat_state.reasoning_status
+    if not rs or not rs.extmark_id then
+      return
+    end
+
+    local header_row0 = chat.chat_state._stream_header_row or 0
+
+    if reasoning_summary == "" then
+      -- Clear overlay
+      vim.api.nvim_buf_set_extmark(bufnr, reasoning_ns, header_row0, 0, {
+        id = rs.extmark_id,
+        virt_lines = {},
+        virt_lines_above = false,
+      })
+      return
+    end
+
+    local virt = {}
+    table.insert(virt, { { " Reasoning summary:", "Comment" } })
+    for _, ln in ipairs(vim.split(reasoning_summary, "\n", { plain = true })) do
+      table.insert(virt, { { "  " .. ln, "Comment" } })
+    end
+
+    vim.api.nvim_buf_set_extmark(bufnr, reasoning_ns, header_row0, 0, {
+      id = rs.extmark_id,
+      virt_lines = virt,
+      virt_lines_above = false,
+    })
+  end
+
+  -- Render the aggregated per-tool status as a virt_lines overlay
+  local function update_tool_status_overlay()
+    if not (chat.chat_state and chat.chat_state.buffers and chat.chat_state.buffers.chat) then
+      return
+    end
+    local bufnr = chat.chat_state.buffers.chat
+    if not vim.api.nvim_buf_is_valid(bufnr) then
+      return
+    end
+    local ts = chat.chat_state.tool_status
+    if not ts or not ts.extmark_id then
+      return
+    end
+
+    local header_row0 = chat.chat_state._stream_header_row or 0
+
+    local arr = {}
+    local total_bytes = 0
+
+    local function human_bytes(n)
+      if not n or n <= 0 then
+        return "0 B"
+      end
+      if n < 1024 then
+        return string.format("%d B", n)
+      end
+      if n < 1024 * 1024 then
+        return string.format("%.1f KB", n / 1024)
+      end
+      return string.format("%.1f MB", n / (1024 * 1024))
+    end
+
+    for _, rec in pairs(tool_calls_by_id) do
+      table.insert(arr, rec)
+    end
+    table.sort(arr, function(a, b)
+      return (a.index or 0) < (b.index or 0)
+    end)
+
+    for _, tc in ipairs(arr) do
+      total_bytes = total_bytes + (tc.total_bytes or 0)
+    end
+
+    if #arr == 0 then
+      -- Nothing to show
+      vim.api.nvim_buf_set_extmark(bufnr, tool_status_ns, header_row0, 0, {
+        id = ts.extmark_id,
+        virt_lines = {},
+        virt_lines_above = false,
+      })
+      return
+    end
+
+    local virt = {}
+    local header = " Preparing tool calls…"
+    if total_bytes > 0 then
+      header = header .. string.format(" (received %s)", human_bytes(total_bytes))
+    end
+    table.insert(virt, { { header, "Comment" } })
+
+    for _, tc in ipairs(arr) do
+      local idx = tc.index or 0
+      local name = (tc["function"] and tc["function"].name) or tc.name or "tool"
+      local mark = tc.done and "✓" or "…"
+      local label = name
+      if tc.path and tc.path ~= "" then
+        label = string.format("%s (%s)", name, tc.path)
+      end
+      local b = tc.total_bytes or 0
+      local line = string.format("  %d. [%s] %s: %s", idx, mark, label, human_bytes(b))
+      table.insert(virt, { { line, "Comment" } })
+    end
+
+    vim.api.nvim_buf_set_extmark(bufnr, tool_status_ns, header_row0, 0, {
+      id = ts.extmark_id,
+      virt_lines = virt,
+      virt_lines_above = false,
+    })
+  end
 
   -- Render the aggregated per-tool byte counts for the current turn
   local function render_tool_prep_status()
@@ -1200,13 +1386,13 @@ function chat.stream_ai_response(messages)
     -- CONTENT PROCESSING
     if ctype == "content" and cdata ~= "" then
       content = tostring(content) .. cdata
-      chat.update_streaming_message(reason, tostring(content or ""), false, reasoning_summary)
+      append_stream_text(cdata)
     elseif ctype == "reasoning" and cdata ~= "" then
       reason = reason .. cdata
-      chat.update_streaming_message(reason, tostring(content), false, reasoning_summary)
+      --chat.update_streaming_message(reason, tostring(content), false, reasoning_summary)
     elseif ctype == "reasoning_summary" and cdata ~= "" then
       reasoning_summary = reasoning_summary .. cdata
-      chat.update_streaming_message(reason, tostring(content), false, reasoning_summary)
+      update_reasoning_overlay()
     elseif ctype == "tool_progress" then
       -- Handle the new progress event
       local pid = cdata.id
@@ -1216,16 +1402,16 @@ function chat.stream_ai_response(messages)
         return
       end
 
-      -- Lazy initialise entry so we do not depend on tool_calls arriving first
       if not tool_calls_by_id[pid] then
         tool_calls_by_id[pid] = {
           id = pid,
           index = #tool_calls_response + 1,
           type = "function",
-          ["function"] = { name = "tool", arguments = "" }, -- placeholder, updated later
+          ["function"] = { name = "tool", arguments = "" },
           name = "tool",
           arguments = nil,
           total_bytes = 0,
+          done = false,
         }
         table.insert(tool_calls_response, tool_calls_by_id[pid])
       end
@@ -1233,17 +1419,12 @@ function chat.stream_ai_response(messages)
       local t = tool_calls_by_id[pid]
       t.total_bytes = (t.total_bytes or 0) + pbytes
 
-      -- Re-render the status with the new byte counts (name may still be placeholder)
-      local status = render_tool_prep_status()
-      if status ~= "" then
-        -- We tunnel the status through the "reason" parameter; update_streaming_message
-        -- recognises "Preparing tool calls…" and renders it as a separate block.
-        chat.update_streaming_message(status, tostring(content or ""), false, reasoning_summary)
-      end
+      -- Update overlay only
+      update_tool_status_overlay()
     elseif ctype == "tool_calls" then
       local calls = type(cdata) == "table" and cdata or {}
 
-      -- 1. Update / insert tool call records from this event
+      -- Update / insert tool call records from this event
       for _, call in ipairs(calls) do
         local id = call.id or call.call_id
         if not id or id == "" then
@@ -1254,7 +1435,7 @@ function chat.stream_ai_response(messages)
 
         local args = (call["function"] and call["function"].arguments) or call.arguments or ""
 
-        -- Try to extract a 'path' field from the JSON arguments for display
+        -- Extract a 'path' field from JSON arguments for display (if present)
         local display_path = nil
         if args ~= "" then
           local ok, decoded = pcall(vim.json.decode, args)
@@ -1277,7 +1458,6 @@ function chat.stream_ai_response(messages)
           }
           table.insert(tool_calls_response, tool_calls_by_id[id])
         else
-          -- Update existing placeholder with the real name and arguments
           local existing = tool_calls_by_id[id]
           existing.name = fn_name or existing.name
           existing.arguments = args or existing.arguments
@@ -1289,48 +1469,14 @@ function chat.stream_ai_response(messages)
         end
       end
 
-      -- 2. Build a human-readable list of tool calls with arguments
-      local call_summaries = {}
-      local arr2 = {}
-      for _, rec in pairs(tool_calls_by_id) do
-        table.insert(arr2, rec)
-      end
-      table.sort(arr2, function(a, b)
-        return (a.index or 0) < (b.index or 0)
-      end)
-
-      for _, rec in ipairs(arr2) do
-        local name = rec.name or (rec["function"] and rec["function"].name) or "tool"
-        local args = rec.arguments or (rec["function"] and rec["function"].arguments) or ""
-        local preview = tostring(args):gsub("%s+", " ")
-        if #preview > 120 then
-          preview = preview:sub(1, 117) .. "..."
-        end
-        table.insert(call_summaries, string.format("%d. %s(%s)", rec.index or 0, name, preview))
-      end
-
-      if #call_summaries > 0 then
-        local extra = "Tool calls:\n" .. table.concat(call_summaries, "\n")
-        -- Append to the visible content area (under the assistant text)
-        chat.append_to_streaming_message(reason, tostring(content or ""), extra, reasoning_summary)
-      end
-
-      -- 3. Re-render the status panel now that names/args are known
-      local status = render_tool_prep_status()
-      if status ~= "" then
-        chat.update_streaming_message(status, tostring(content or ""), false, reasoning_summary)
-      end
+      -- Update overlay only (no "Tool calls:" text injected into the chat body)
+      update_tool_status_overlay()
     elseif ctype == "tool_done" then
-      -- Mark a tool call as completed and re-render status
       local pid = type(cdata) == "table" and cdata.id or cdata
       if pid and tool_calls_by_id[pid] then
         local t = tool_calls_by_id[pid]
         t.done = true
-
-        local status = render_tool_prep_status()
-        if status ~= "" then
-          chat.update_streaming_message(status, tostring(content or ""), false, reasoning_summary)
-        end
+        update_tool_status_overlay()
       end
     end
   end, function()
