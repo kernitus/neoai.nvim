@@ -2,20 +2,45 @@ package com.github.kernitus.neoai
 
 import ai.koog.prompt.params.LLMParams.ToolChoice
 
-import ai.koog.prompt.dsl.prompt
+import ai.koog.agents.core.tools.ToolDescriptor
+import ai.koog.prompt.dsl.Prompt
 import ai.koog.prompt.executor.clients.openai.OpenAIClientSettings
-import ai.koog.prompt.executor.clients.openai.OpenAIModels
+import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
 import ai.koog.prompt.executor.clients.openai.OpenAIResponsesParams
+import ai.koog.prompt.llm.LLModel
+import ai.koog.prompt.message.Message
+import ai.koog.prompt.message.ResponseMetaInfo
+import ai.koog.prompt.params.LLMParams
+import ai.koog.prompt.streaming.StreamFrame
+import io.ktor.client.HttpClient
+import io.ktor.client.plugins.DefaultRequest
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.preparePost
+import io.ktor.client.request.setBody
+import io.ktor.client.request.url
+import io.ktor.client.statement.bodyAsChannel
+import io.ktor.http.ContentType
+import io.ktor.http.contentType
+import io.ktor.utils.io.readUTF8Line
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+
+
+import ai.koog.prompt.dsl.prompt
+import ai.koog.prompt.executor.clients.openai.OpenAIModels
 import ai.koog.prompt.executor.clients.openai.base.models.ReasoningEffort
 import ai.koog.prompt.executor.clients.openai.models.ReasoningConfig
 import ai.koog.prompt.executor.clients.openai.models.ReasoningSummary
 import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
-import ai.koog.prompt.message.Message
 import ai.koog.prompt.message.RequestMetaInfo
 import com.github.kernitus.neoai.ai_tools.CustomReadFileTool
 import com.github.kernitus.neoai.ai_tools.CustomListDirectoryTool
 import com.github.kernitus.neoai.ai_tools.CustomEditFileTool
-import ai.koog.prompt.streaming.StreamFrame
 import ai.koog.agents.core.tools.ToolRegistry
 import ai.koog.prompt.llm.LLMProvider
 import ai.koog.agents.core.agent.AIAgent
@@ -39,7 +64,6 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import ai.koog.prompt.params.LLMParams
 import ai.koog.prompt.streaming.toMessageResponses
 import kotlinx.coroutines.flow.toList
 import ai.koog.prompt.executor.clients.openai.OpenAIChatParams
@@ -50,6 +74,20 @@ private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
 // Custom GPT‑5.1 model
 private val GPT5_1 = OpenAIModels.Chat.GPT5.copy(id = "gpt-5.1")
+
+object DebugLogger {
+    private val file = java.io.File("/tmp/neoai-debug.log")
+    
+    fun log(msg: String) {
+        try {
+            // Simple timestamped log
+            file.appendText("[${java.time.LocalTime.now()}] $msg\n")
+        } catch (e: Exception) { 
+            // Fail silently to avoid crashing the plugin
+        }
+    }
+}
+
 
 private fun pickModel(name: String): ai.koog.prompt.llm.LLModel {
     return when (name.lowercase()) {
@@ -161,45 +199,65 @@ private fun formatToolsForPrompt(toolsVal: org.msgpack.value.Value?): String {
     }
 }
 
-// --- Strategy for Streaming with Tools ---
-
-// 1. Accept params argument
 private fun streamingWithToolsStrategy(customParams: LLMParams?) =
     strategy<List<Message.Request>, String>("streaming_loop") {
         val executeMultipleTools by nodeExecuteMultipleTools(parallelTools = true)
 
-        // 2. Define custom node manually instead of using nodeLLMRequestStreamingAndSendResults
         val nodeStreaming by node<List<Message.Request>, List<Message.Response>> { input ->
             llm.writeSession {
-                // 3. Inject the parameters if they exist
                 if (customParams != null) {
                     changeLLMParams(customParams)
                 }
 
-                // 4. Execute streaming (logic copied from the standard extension)
-                requestLLMStreaming()
-                    .toList()
-                    .toMessageResponses()
-                    .also { responses ->
-                        // Update history with the assistant's response
-                        appendPrompt { messages(responses) }
+                val textBuffer = StringBuilder()
+                val toolCalls = mutableListOf<Message.Tool.Call>()
+
+                // Collect frames to keep stream alive and capture data
+                requestLLMStreaming().collect { frame ->
+                    when (frame) {
+                        is StreamFrame.Append -> {
+                            textBuffer.append(frame.text)
+                        }
+                        is StreamFrame.ToolCall -> {
+                            toolCalls.add(
+                                Message.Tool.Call(
+                                    frame.id,
+                                    frame.name,
+                                    frame.content,
+                                    ResponseMetaInfo.Empty // ✅ Fixed: Added MetaInfo
+                                )
+                            )
+                        }
+                        is StreamFrame.End -> {}
                     }
+                }
+
+                val responses = mutableListOf<Message.Response>()
+
+                if (textBuffer.isNotEmpty()) {
+                    responses.add(
+                        Message.Assistant(
+                            textBuffer.toString(),
+                            ResponseMetaInfo.Empty // ✅ Fixed: Added MetaInfo
+                        )
+                    )
+                }
+
+                // ✅ Fixed: Ensure tool calls are returned to the graph
+                responses.addAll(toolCalls)
+
+                appendPrompt { messages(responses) }
+
+                responses
             }
         }
 
         val applyRequestToSession by node<List<Message.Request>, List<Message.Request>> { input ->
             llm.writeSession {
                 appendPrompt {
-                    input.filterIsInstance<Message.User>()
-                        .forEach {
-                            user(it.content)
-                        }
-
+                    input.filterIsInstance<Message.User>().forEach { user(it.content) }
                     tool {
-                        input.filterIsInstance<Message.Tool.Result>()
-                            .forEach {
-                                result(it)
-                            }
+                        input.filterIsInstance<Message.Tool.Result>().forEach { result(it) }
                     }
                 }
                 input
@@ -210,7 +268,6 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
             input.map { it.toMessage() }
         }
 
-        // Define edges
         edge(nodeStart forwardTo applyRequestToSession)
         edge(applyRequestToSession forwardTo nodeStreaming)
         edge(nodeStreaming forwardTo executeMultipleTools onMultipleToolCalls { true })
@@ -220,13 +277,11 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
             nodeStreaming forwardTo nodeFinish onCondition {
                 it.filterIsInstance<Message.Tool.Call>().isEmpty()
             } transformed {
-                it.filterIsInstance<Message.Assistant>()
-                    .firstOrNull()?.content ?: ""
+                it.filterIsInstance<Message.Assistant>().firstOrNull()?.content ?: ""
             }
         )
     }
 
-// --- Main ---
 
 fun main() = runBlocking {
     val inputStream = BufferedInputStream(System.`in`)
@@ -280,6 +335,7 @@ fun main() = runBlocking {
 }
 
 fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker) {
+    DebugLogger.log("Method received: $method")
     if (method == "generate") {
         if (paramsArray.size() > 0) {
             try {
@@ -345,6 +401,7 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
                     try {
                         generate(url, apiKey, model, reasoningEffort, body, cwd, pluginRoot, packer)
                     } catch (e: Exception) {
+                         DebugLogger.log("🔥 CRITICAL FAILURE in generate: ${e.message}")
                         sendError("Generation failed: ${e.message}", packer)
                     }
                 }
@@ -365,7 +422,6 @@ suspend fun generate(
     pluginRoot: String,
     packer: MessagePacker
 ) {
-    // 1. API Key Logic
     val finalApiKey = apiKey.ifBlank {
         System.getenv("OPENAI_API_KEY") ?: ""
     }
@@ -375,14 +431,12 @@ suspend fun generate(
         return
     }
 
-    // 2. Body Parsing
     if (!body.isMapValue) {
         sendError("Body must be a map/object", packer)
         return
     }
 
     val bodyMap = body.asMapValue().map()
-
     fun getValue(key: String): org.msgpack.value.Value? {
         val k = org.msgpack.value.ValueFactory.newString(key)
         return bodyMap[k]
@@ -394,11 +448,20 @@ suspend fun generate(
         return
     }
 
-    val toolsVal = getValue("tools")
+    // 1. Instantiate tools first so we can read their descriptions
+    val readFileTool = CustomReadFileTool(JVMFileSystemProvider.ReadOnly, cwd)
+    val listDirTool = CustomListDirectoryTool<java.nio.file.Path>(cwd)
+    val editFileTool = CustomEditFileTool(JVMFileSystemProvider.ReadWrite, cwd)
 
-    // Construct the full path: pluginRoot + relative path
+    val myTools = listOf(readFileTool, listDirTool, editFileTool)
+
+    // 2. Dynamically build the description string
+    val toolDescriptions = myTools.joinToString("\n") { tool ->
+        "- **${tool.name}**: ${tool.description}"
+    }
+
+    // 3. Prepare System Prompt
     val systemPromptFile = java.io.File(pluginRoot, "lua/neoai/prompts/system_prompt.md")
-
     if (!systemPromptFile.exists()) {
         sendError("System prompt file not found at: ${systemPromptFile.absolutePath}", packer)
         return
@@ -406,9 +469,8 @@ suspend fun generate(
 
     val systemPrompt = try {
         val content = systemPromptFile.readText()
-        val toolsFormatted = formatToolsForPrompt(toolsVal)
         content
-            .replace("%tools", toolsFormatted)
+            .replace("%tools", toolDescriptions) // ✅ Dynamic injection
             .replace("%agents", "")
     } catch (e: Exception) {
         sendError("Failed to read system prompt file: ${e.message}", packer)
@@ -433,7 +495,6 @@ suspend fun generate(
         if (type != "message") continue
 
         val role = getItemString("role") ?: continue
-
         val contentKey = org.msgpack.value.ValueFactory.newString("content")
         val contentVal = itemMap[contentKey]
         if (contentVal == null || !contentVal.isArrayValue) continue
@@ -443,21 +504,17 @@ suspend fun generate(
         for (c in contents) {
             if (!c.isMapValue) continue
             val cObj = c.asMapValue().map()
-
             fun getContentString(key: String): String? {
                 val k = org.msgpack.value.ValueFactory.newString(key)
                 val v = cObj[k] ?: return null
                 return if (v.isStringValue) v.asStringValue().asString() else null
             }
-
             val cType = getContentString("type")
             val text = getContentString("text")
-
             if ((cType == "input_text" || cType == "output_text" || cType == "text") && !text.isNullOrBlank()) {
                 contentParts.add(text)
             }
         }
-
         val fullContent = contentParts.joinToString("\n")
         if (fullContent.isBlank()) continue
 
@@ -471,28 +528,20 @@ suspend fun generate(
         return
     }
 
-    // 5. Tool Registry
+    // 5. Register the tools we created earlier
     val toolRegistry = ToolRegistry {
-        tool(CustomReadFileTool(JVMFileSystemProvider.ReadOnly, cwd))
-        tool(CustomListDirectoryTool<java.nio.file.Path>(cwd))
-        tool(CustomEditFileTool(JVMFileSystemProvider.ReadWrite, cwd))
+        myTools.forEach { tool(it) }
     }
 
-    // 6. Pick Model
     val model = pickModel(modelName)
 
-    // 7. Configure Client Settings (URL)
-    // We pass the URL to the settings, NOT the API key.
     val clientSettings = if (url.isNotBlank()) {
         OpenAIClientSettings(baseUrl = url)
     } else {
         OpenAIClientSettings()
     }
 
-    // 8. Initialize Client
-    // We pass the API key and the settings here.
     val openAIClient = FixedOpenAILLMClient(apiKey = finalApiKey, settings = clientSettings)
-
     val executor = MultiLLMPromptExecutor(LLMProvider.OpenAI to openAIClient)
 
     val reasoningParams = if (isReasoningModel(modelName)) {
@@ -501,8 +550,6 @@ suspend fun generate(
             "high" -> ReasoningEffort.HIGH
             else -> ReasoningEffort.MEDIUM
         }
-
-        // USE THIS for /v1/responses and nested {"reasoning": {"effort": "..."}}
         OpenAIResponsesParams(
             reasoning = ReasoningConfig(effort = effort),
             toolChoice = ToolChoice.Auto
@@ -511,7 +558,6 @@ suspend fun generate(
         null
     }
 
-    // 10. Create Agent
     val agent = AIAgent(
         promptExecutor = executor,
         strategy = streamingWithToolsStrategy(reasoningParams),
@@ -527,11 +573,9 @@ suspend fun generate(
                                 sendChunk("content", frame.text, packer)
                             }
                         }
-
                         is StreamFrame.ToolCall -> {
                             sendToolCall(frame.id, frame.name, frame.content, packer)
                         }
-
                         is StreamFrame.End -> {}
                     }
                 }
@@ -542,7 +586,6 @@ suspend fun generate(
         }
     )
 
-    // 11. Run
     try {
         agent.run(messages)
         sendComplete(packer)
@@ -550,6 +593,7 @@ suspend fun generate(
         sendError("Agent execution failed: ${e.message}", packer)
     }
 }
+
 
 
 fun sendChunk(type: String, data: String, packer: MessagePacker) {
@@ -618,5 +662,7 @@ fun sendComplete(packer: MessagePacker) {
 }
 
 fun sendError(msg: String, packer: MessagePacker) {
+    DebugLogger.log("❌ SENDING ERROR: $msg")
     sendChunk("error", msg, packer)
 }
+

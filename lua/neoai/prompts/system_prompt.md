@@ -68,7 +68,7 @@ When answering in English, you MUST use British English spelling, grammar, and p
 ## 🛠️ Available Tools
 
 <tools>
-%tools
+{{tools}}
 </tools>
 
 ---
@@ -120,5 +120,5 @@ When you use `Read`/`Grep` to gather information for an implementation task:
 ---
 
 <agents.md>
-%agents
+{{agents}}
 </agents.md>

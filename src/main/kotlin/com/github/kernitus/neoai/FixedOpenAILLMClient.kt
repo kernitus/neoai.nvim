@@ -13,12 +13,14 @@ import ai.koog.prompt.streaming.StreamFrame
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.DefaultRequest
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.request.post
+import io.ktor.client.request.preparePost
 import io.ktor.client.request.setBody
 import io.ktor.client.request.url
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
+import io.ktor.utils.io.readUTF8Line
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.SerialName
@@ -27,27 +29,27 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 
-/**
- * A custom client that fixes the missing tools behaviour in the official OpenAILLMClient
- * for the Responses API streaming endpoint.
- */
 class FixedOpenAILLMClient(
     apiKey: String,
     private val settings: OpenAIClientSettings,
-    private val responseJson: Json = Json { ignoreUnknownKeys = true; encodeDefaults = false }
+    private val responseJson: Json =
+        Json {
+            ignoreUnknownKeys = true
+            encodeDefaults = false
+        },
 ) : OpenAILLMClient(apiKey, settings) {
-
-    private val myHttpClient = HttpClient {
-        install(ContentNegotiation)
-        install(DefaultRequest) {
-            headers.append("Authorization", "Bearer $apiKey")
+    private val myHttpClient =
+        HttpClient {
+            install(ContentNegotiation)
+            install(DefaultRequest) {
+                headers.append("Authorization", "Bearer $apiKey")
+            }
         }
-    }
 
     override fun executeStreaming(
         prompt: Prompt,
         model: LLModel,
-        tools: List<ToolDescriptor>
+        tools: List<ToolDescriptor>,
     ): Flow<StreamFrame> {
         val params = prompt.params
 
@@ -56,138 +58,148 @@ class FixedOpenAILLMClient(
         }
 
         return flow {
-            // 1. Map Tools
-            val apiTools = tools.map { tool ->
-                FixedTool(
-                    type = "function",
-                    function = FixedFunction(
+            // 1. Map Tools (Flattened)
+            val apiTools =
+                tools.map { tool ->
+                    FixedTool(
+                        type = "function",
                         name = tool.name,
                         description = tool.description,
-                        parameters = tool.paramsToJsonObject()
+                        parameters = tool.paramsToJsonObject(),
                     )
-                )
-            }
+                }
 
             // 2. Map Messages
-            val inputItems: List<FixedItem> = prompt.messages.mapNotNull { msg ->
-                when (msg) {
-                    is Message.System -> FixedItem(
-                        type = "message",
-                        role = "developer",
-                        content = listOf(FixedContent(type = "input_text", text = msg.content))
-                    )
+            val inputItems: List<FixedItem> =
+                prompt.messages.mapNotNull { msg ->
+                    when (msg) {
+                        is Message.System -> {
+                            FixedItem(
+                                type = "message",
+                                role = "developer",
+                                content = listOf(FixedContent(type = "input_text", text = msg.content)),
+                            )
+                        }
 
-                    is Message.User -> FixedItem(
-                        type = "message",
-                        role = "user",
-                        content = listOf(FixedContent(type = "input_text", text = msg.content))
-                    )
+                        is Message.User -> {
+                            FixedItem(
+                                type = "message",
+                                role = "user",
+                                content = listOf(FixedContent(type = "input_text", text = msg.content)),
+                            )
+                        }
 
-                    is Message.Assistant -> FixedItem(
-                        type = "message",
-                        role = "assistant",
-                        content = listOf(FixedContent(type = "text", text = msg.content))
-                    )
+                        is Message.Assistant -> {
+                            FixedItem(
+                                type = "message",
+                                role = "assistant",
+                                // ✅ FIX: Use 'output_text' instead of 'text'
+                                content = listOf(FixedContent(type = "output_text", text = msg.content)),
+                            )
+                        }
 
-                    is Message.Tool.Result -> FixedItem(
-                        type = "function_call_output",
-                        callId = msg.id,
-                        output = msg.content
-                    )
+                        is Message.Tool.Result -> {
+                            FixedItem(
+                                type = "function_call_output",
+                                callId = msg.id,
+                                output = msg.content,
+                            )
+                        }
 
-                    is Message.Tool.Call -> FixedItem(
-                        type = "function_call",
-                        callId = msg.id,
-                        name = msg.tool,
-                        arguments = msg.content
-                    )
+                        is Message.Tool.Call -> {
+                            FixedItem(
+                                type = "function_call",
+                                callId = msg.id,
+                                name = msg.tool,
+                                arguments = msg.content,
+                            )
+                        }
 
-                    else -> null
+                        else -> {
+                            null
+                        }
+                    }
                 }
-            }
 
             // 3. Construct Request
-            val request = FixedRequest(
-                model = model.id,
-                input = inputItems,
-                tools = apiTools,
-                stream = true,
-                toolChoice = when (params.toolChoice) {
-                    LLMParams.ToolChoice.Auto -> "auto"
-                    LLMParams.ToolChoice.None -> "none"
-                    LLMParams.ToolChoice.Required -> "required"
-                    // Note: Named tool choice requires a specific object structure, defaulting to auto for simplicity here
-                    // unless you specifically need to force a named tool.
-                    else -> null
-                },
-                maxOutputTokens = params.maxTokens,
-                reasoning = params.reasoning?.let {
-                    FixedReasoning(
-                        effort = it.effort?.name?.lowercase() ?: "medium"
-                    )
-                }
-            )
+            val request =
+                FixedRequest(
+                    model = model.id,
+                    input = inputItems,
+                    tools = apiTools,
+                    stream = true,
+                    toolChoice = "auto",
+                    maxOutputTokens = params.maxTokens,
+                    reasoning =
+                        params.reasoning?.let {
+                            FixedReasoning(effort = it.effort?.name?.lowercase() ?: "medium")
+                        },
+                )
 
             val requestBody = responseJson.encodeToString(request)
 
             // 4. Execute Request
             var urlStr = settings.baseUrl.trimEnd('/')
-            val path = settings.responsesAPIPath
-
-            if (!urlStr.endsWith(path)) {
-                if (urlStr.endsWith("/v1") && path.startsWith("v1/")) {
-                    urlStr = urlStr.removeSuffix("/v1")
-                }
-                urlStr = "$urlStr/$path"
+            if (!urlStr.endsWith("/responses") && !urlStr.contains("responses")) {
+                urlStr = "$urlStr/responses"
             }
 
-            myHttpClient.post {
-                url(urlStr)
-                contentType(ContentType.Application.Json)
-                setBody(requestBody)
-            }.bodyAsText().lineSequence().forEach { line ->
-                if (line.startsWith("data: ")) {
-                    val data = line.removePrefix("data: ").trim()
-                    if (data != "[DONE]") {
-                        try {
-                            val event = responseJson.decodeFromString<FixedStreamEvent>(data)
+            myHttpClient
+                .preparePost {
+                    url(urlStr)
+                    contentType(ContentType.Application.Json)
+                    setBody(requestBody)
+                }.execute { response ->
+                    if (response.status.value != 200) {
+                        val err = response.bodyAsText()
+                        throw Exception("HTTP ${response.status}: $err")
+                    }
 
-                            when (event.type) {
-                                "response.output_text.delta" -> {
-                                    if (event.delta != null) {
-                                        emit(StreamFrame.Append(event.delta))
+                    val channel = response.bodyAsChannel()
+                    while (!channel.isClosedForRead) {
+                        val line = channel.readUTF8Line() ?: break
+
+                        if (line.startsWith("data: ")) {
+                            val data = line.removePrefix("data: ").trim()
+                            if (data != "[DONE]") {
+                                try {
+                                    val event = responseJson.decodeFromString<FixedStreamEvent>(data)
+
+                                    when (event.type) {
+                                        "response.output_text.delta" -> {
+                                            if (event.delta != null) {
+                                                emit(StreamFrame.Append(event.delta))
+                                            }
+                                        }
+
+                                        "response.output_item.done" -> {
+                                            val item = event.item
+                                            if (item != null && item.type == "function_call") {
+                                                emit(
+                                                    StreamFrame.ToolCall(
+                                                        id = item.callId ?: "",
+                                                        name = item.name ?: "",
+                                                        content = item.arguments ?: "",
+                                                    ),
+                                                )
+                                            }
+                                        }
+
+                                        "response.completed" -> {
+                                            emit(StreamFrame.End(null, ResponseMetaInfo.Empty))
+                                        }
                                     }
+                                } catch (e: Exception) {
+                                    // Ignore parsing errors
                                 }
-
-                                "response.output_item.done" -> {
-                                    val item = event.item
-                                    if (item != null && item.type == "function_call") {
-                                        emit(
-                                            StreamFrame.ToolCall(
-                                                id = item.callId ?: "",
-                                                name = item.name ?: "",
-                                                content = item.arguments ?: ""
-                                            )
-                                        )
-                                    }
-                                }
-
-                                "response.completed" -> {
-                                    emit(StreamFrame.End(null, ResponseMetaInfo.Empty))
-                                }
-
-                                else -> {}
                             }
-                        } catch (e: Exception) {
-                            // Ignore parsing errors
                         }
                     }
                 }
-            }
         }
     }
 
-    // --- PRIVATE DTOs ---
+    // --- DTOs ---
 
     @Serializable
     private data class FixedRequest(
@@ -197,11 +209,13 @@ class FixedOpenAILLMClient(
         val stream: Boolean,
         @SerialName("tool_choice") val toolChoice: String? = null,
         @SerialName("max_output_tokens") val maxOutputTokens: Int? = null,
-        val reasoning: FixedReasoning? = null
+        val reasoning: FixedReasoning? = null,
     )
 
     @Serializable
-    private data class FixedReasoning(val effort: String)
+    private data class FixedReasoning(
+        val effort: String,
+    )
 
     @Serializable
     private data class FixedItem(
@@ -211,33 +225,27 @@ class FixedOpenAILLMClient(
         @SerialName("call_id") val callId: String? = null,
         val output: String? = null,
         val name: String? = null,
-        val arguments: String? = null
+        val arguments: String? = null,
     )
 
     @Serializable
     private data class FixedContent(
         val type: String,
-        val text: String? = null
+        val text: String? = null,
     )
 
     @Serializable
     private data class FixedTool(
         val type: String,
-        val function: FixedFunction
-    )
-
-    @Serializable
-    private data class FixedFunction(
         val name: String,
         val description: String?,
-        val parameters: JsonObject
+        val parameters: JsonObject,
     )
 
     @Serializable
     private data class FixedStreamEvent(
         val type: String,
         val delta: String? = null,
-        val item: FixedItem? = null
+        val item: FixedItem? = null,
     )
 }
-
