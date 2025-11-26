@@ -1044,6 +1044,7 @@ end
 
 -- Stream AI response
 function chat.stream_ai_response(messages)
+  local log = require("neoai.debug").log
   log("stream_ai_response: entry | msgs=%d", #(messages or {}))
   local api = require("neoai.api")
   chat.chat_state.streaming_active = true
@@ -1055,57 +1056,24 @@ function chat.stream_ai_response(messages)
   end
 
   local reason, content, tool_calls_response = "", "", {}
-  local tool_calls_by_id = {} -- Accumulate tool calls across chunks (id -> record)
-  local reasoning_summary = "" -- Accumulate streamed reasoning summary
-  log("stream_ai_response: init state")
+  local tool_calls_by_id = {}
+  local reasoning_summary = ""
   local start_time = os.time()
   local saw_first_token = false
   local has_completed = false
 
-  local function human_bytes(n)
-    if not n or n <= 0 then
-      return "0 B"
-    end
-    if n < 1024 then
-      return string.format("%d B", n)
-    elseif n < 1024 * 1024 then
-      return string.format("%.1f KB", n / 1024)
-    elseif n < 1024 * 1024 * 1024 then
-      return string.format("%.2f MB", n / (1024 * 1024))
-    else
-      return string.format("%.2f GB", n / (1024 * 1024 * 1024))
-    end
-  end
+  -- Timeout Configuration
+  local cfg = require("neoai.config").values.chat
+  local thinking_timeout_s = cfg.thinking_timeout or 300
+  local stall_timeout_s = cfg.stream_stall_timeout or 60
 
-  local function render_tool_prep_status()
-    local per_call = {}
-    local total = 0
-    for _, tc in ipairs(tool_calls_response) do
-      local name = (tc["function"] and tc["function"].name) or (tc.type or "function")
-      local args = (tc["function"] and tc["function"].arguments) or ""
-      local size = #args
-      total = total + size
-      table.insert(per_call, string.format("- %s: %s", name ~= "" and name or "function", human_bytes(size)))
-    end
-
-    local header = "\nPreparing tool calls…"
-    if #per_call > 0 then
-      header = header .. string.format(" (total %s)", human_bytes(total))
-    end
-    local body = table.concat(per_call, "\n")
-    local display = header
-    if body ~= "" then
-      display = display .. "\n" .. body
-    end
-    return display
-  end
+  local current_timeout_limit = thinking_timeout_s
 
   if chat.chat_state._timeout_timer then
     safe_stop_and_close_timer(chat.chat_state._timeout_timer)
     chat.chat_state._timeout_timer = nil
   end
 
-  local timeout_duration_s = require("neoai.config").values.chat.thinking_timeout or 300
   local thinking_timeout_timer = vim.loop.new_timer()
   chat.chat_state._timeout_timer = thinking_timeout_timer
 
@@ -1124,7 +1092,9 @@ function chat.stream_ai_response(messages)
     stop_thinking_animation()
     disable_ctrl_c_cancel()
 
-    local err_msg = "NeoAI: Timed out after " .. timeout_duration_s .. "s waiting for a response."
+    local err_msg =
+      string.format("NeoAI: Timed out after %ds waiting for a response (stall detected).", current_timeout_limit)
+
     chat.add_message(MESSAGE_TYPES.ERROR, err_msg, { timeout = true })
     update_chat_display()
     vim.notify(err_msg, vim.log.levels.ERROR)
@@ -1137,85 +1107,147 @@ function chat.stream_ai_response(messages)
     require("neoai.api").cancel()
   end
 
-  thinking_timeout_timer:start(timeout_duration_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+  -- Start the initial "Thinking" timer
+  thinking_timeout_timer:start(thinking_timeout_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+
+  local last_timer_reset = 0
+
   api.stream(messages, function(chunk)
+    -- DATA NORMALISATION
+    local ctype = chunk.type or ""
+    local cdata = chunk.data or chunk.delta or ""
+
+    if ctype == "response.reasoning_summary_text.delta" then
+      ctype = "reasoning_summary"
+    elseif ctype == "response.text.delta" then
+      ctype = "content"
+    elseif ctype == "tool_call" then
+      ctype = "tool_calls"
+      if type(cdata) == "table" and not cdata[1] then
+        cdata = { cdata }
+      end
+    end
+
+    -- TIMER MANAGEMENT
+    local now_ms = vim.loop.now()
+
     if not saw_first_token then
       saw_first_token = true
       capture_thinking_duration_for_announce()
-      -- Convert to a stall timer that resets on every chunk
-      local stall_s = (require("neoai.config").values.chat.stream_stall_timeout or 60)
+      current_timeout_limit = stall_timeout_s
       thinking_timeout_timer:stop()
-      thinking_timeout_timer:start(stall_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+      thinking_timeout_timer:start(stall_timeout_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+      last_timer_reset = now_ms
     else
-      -- reset stall timer on each chunk
-      local stall_s = (require("neoai.config").values.chat.stream_stall_timeout or 60)
-      thinking_timeout_timer:stop()
-      thinking_timeout_timer:start(stall_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+      if (now_ms - last_timer_reset) > 1000 then
+        thinking_timeout_timer:stop()
+        thinking_timeout_timer:start(stall_timeout_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+        last_timer_reset = now_ms
+      end
     end
 
-    if chunk.type == "content" and chunk.data ~= "" then
-      content = tostring(content) .. chunk.data
+    -- CONTENT PROCESSING
+    if ctype == "content" and cdata ~= "" then
+      content = tostring(content) .. cdata
       chat.update_streaming_message(reason, tostring(content or ""), false, reasoning_summary)
-    elseif chunk.type == "reasoning" and chunk.data ~= "" then
-      reason = reason .. chunk.data
+    elseif ctype == "reasoning" and cdata ~= "" then
+      reason = reason .. cdata
       chat.update_streaming_message(reason, tostring(content), false, reasoning_summary)
-    elseif chunk.type == "reasoning_summary" and chunk.data ~= "" then
-      reasoning_summary = reasoning_summary .. chunk.data
+    elseif ctype == "reasoning_summary" and cdata ~= "" then
+      reasoning_summary = reasoning_summary .. cdata
       chat.update_streaming_message(reason, tostring(content), false, reasoning_summary)
-    elseif chunk.type == "tool_calls" then
-      local calls = type(chunk.data) == "table" and chunk.data or {}
-      local n = #calls
-      local ids = {}
-      for _, tc in ipairs(calls) do
-        table.insert(ids, tostring(tc.id or tc.call_id or ("<noid>#" .. tostring(tc.index or -1))))
-      end
-      log("stream_ai_response: chunk tool_calls | n=%d ids=%s", n, table.concat(ids, ","))
+    elseif ctype == "tool_progress" then
+      -- Handle the new progress event
+      local pid = cdata.id
+      local pbytes = tonumber(cdata.bytes) or 0
 
-      -- Accumulate by id across chunks (do not drop earlier calls)
-      local stamp = tostring(os.time())
+      -- FIX: Lazy initialize the tool entry if it doesn't exist yet
+      -- This handles the case where progress arrives before the definition
+      if pid and not tool_calls_by_id[pid] then
+        tool_calls_by_id[pid] = {
+          id = pid,
+          type = "function",
+          ["function"] = { name = "tool", arguments = "" }, -- Placeholder name
+          total_bytes = 0,
+        }
+        table.insert(tool_calls_response, tool_calls_by_id[pid])
+      end
+
+      if pid and tool_calls_by_id[pid] then
+        local t = tool_calls_by_id[pid]
+        t.total_bytes = (t.total_bytes or 0) + pbytes
+
+        -- Re-render the status with the new byte counts
+        local function render_tool_prep_status()
+          local per_call = {}
+          local total = 0
+          local function human_bytes(n)
+            if not n or n <= 0 then
+              return "0 B"
+            end
+            if n < 1024 then
+              return string.format("%d B", n)
+            end
+            return string.format("%.1f KB", n / 1024)
+          end
+
+          local arr = {}
+          for _, rec in pairs(tool_calls_by_id) do
+            table.insert(arr, rec)
+          end
+          table.sort(arr, function(a, b)
+            return tostring(a.id) < tostring(b.id)
+          end)
+
+          for _, tc in ipairs(arr) do
+            local name = (tc["function"] and tc["function"].name) or (tc.type or "function")
+            local b = tc.total_bytes or 0
+            total = total + b
+            table.insert(per_call, string.format("- %s: %s", name, human_bytes(b)))
+          end
+
+          local header = "\nPreparing tool calls…"
+          if total > 0 then
+            header = header .. string.format(" (received %s)", human_bytes(total))
+          end
+          local body = table.concat(per_call, "\n")
+          return header .. (#body > 0 and ("\n" .. body) or "")
+        end
+
+        chat.update_streaming_message(render_tool_prep_status(), tostring(content or ""), false, reasoning_summary)
+      end
+    elseif ctype == "tool_calls" then
+      local calls = type(cdata) == "table" and cdata or {}
+
       for _, tc in ipairs(calls) do
         local id = tc.id or tc.call_id
         if not id or id == "" then
-          if tc.index ~= nil then
-            id = string.format("idx_%d", tc.index)
-          else
-            id = "tc-" .. stamp
+          id = "unknown"
+        end
+
+        if not tool_calls_by_id[id] then
+          local fn_name = (tc["function"] and tc["function"].name) or tc.name or ""
+          tool_calls_by_id[id] = {
+            id = id,
+            type = "function",
+            ["function"] = { name = fn_name, arguments = "" },
+            total_bytes = 0,
+          }
+          table.insert(tool_calls_response, tool_calls_by_id[id])
+        else
+          -- FIX: Update the existing placeholder with the real name
+          local existing = tool_calls_by_id[id]
+          if tc["function"] and tc["function"].name then
+            existing["function"].name = tc["function"].name
+          end
+          if tc["function"] and tc["function"].arguments then
+            existing["function"].arguments = tc["function"].arguments
           end
         end
-        local fn_name = (tc["function"] and tc["function"].name) or tc.name or ""
-        local fn_args = (tc["function"] and tc["function"].arguments) or tc.arguments or ""
-
-        tool_calls_by_id[id] = {
-          id = id,
-          index = tc.index, -- may be nil
-          type = "function",
-          ["function"] = { name = fn_name, arguments = fn_args or "" },
-        }
       end
-
-      -- Rebuild stable array for status UI and for on_complete
-      local arr = {}
-      for _, rec in pairs(tool_calls_by_id) do
-        table.insert(arr, rec)
-      end
-      table.sort(arr, function(a, b)
-        if a.index ~= nil and b.index ~= nil then
-          return a.index < b.index
-        elseif a.index ~= nil then
-          return true
-        elseif b.index ~= nil then
-          return false
-        else
-          return tostring(a.id) < tostring(b.id)
-        end
-      end)
-      tool_calls_response = arr
-
-      -- Show preparation status (sizes), then keep streaming content as usual
-      local prep_status = render_tool_prep_status()
-      chat.update_streaming_message(prep_status, tostring(content or ""), false, reasoning_summary)
     end
   end, function()
+    -- ON COMPLETE
     if has_completed then
       return
     end
@@ -1234,9 +1266,7 @@ function chat.stream_ai_response(messages)
       #tool_calls_response
     )
 
-    -- Persist any streamed assistant content/reasoning before handling tool calls,
-    -- so it remains visible in the chat even after the UI refresh, but do NOT
-    -- put reasoning/summary into assistant content (keep it for UI only).
+    -- Persist content logic
     do
       local have_reason = (reason and reason ~= "")
       local have_summary = (reasoning_summary and reasoning_summary ~= "")
@@ -1244,7 +1274,6 @@ function chat.stream_ai_response(messages)
       if have_reason or have_summary or have_content then
         local meta = { response_time = os.time() - start_time }
         local parts = {}
-
         if have_reason then
           table.insert(parts, "Reasoning:\n" .. reason)
         end
@@ -1255,18 +1284,14 @@ function chat.stream_ai_response(messages)
         if have_content then
           table.insert(parts, content)
         end
-
         local combined = (#parts > 0) and table.concat(parts, "\n\n") or "(plan)"
         meta.display = combined
-
-        -- Store only the assistant's final content (no reasoning/summary) so API history stays clean.
         local content_only = have_content and content or ""
         chat.add_message(MESSAGE_TYPES.ASSISTANT, content_only, meta)
       end
     end
 
     update_chat_display()
-
     disable_ctrl_c_cancel()
 
     if chat.chat_state._ts_suspended and chat.chat_state.buffers.chat then
@@ -1275,32 +1300,26 @@ function chat.stream_ai_response(messages)
     end
 
     if #tool_calls_response > 0 then
-      -- The model turn ended with tool calls; mark stream as ended so the tool orchestrator can resume the loop.
       chat.chat_state.streaming_active = false
       chat.get_tool_calls(tool_calls_response)
     else
-      -- No more tools; end of turn.
       chat.chat_state.streaming_active = false
 
+      -- Auto-resume logic
       local content_txt = tostring(content or "")
       local silent = (content_txt == "")
       local now = os.time()
       local recent_tool = chat.chat_state._last_tool_turn_ts > 0 and ((now - chat.chat_state._last_tool_turn_ts) <= 180)
-
-      -- Detect plan-without-action cues even when no recent tool turn
       local plan_cue = false
-      do
-        -- Tweak phrases here as you see them in the wild
-        if
-          content_txt:match("[Pp]roceeding")
-          or content_txt:match("[Ww]ill%s+read")
-          or content_txt:match("[Rr]eading")
-          or content_txt:match("[Ii]nspecting")
-          or content_txt:match("[Ww]ill%s+apply")
-          or content_txt:match("[Ww]ill%s+implement")
-        then
-          plan_cue = true
-        end
+      if
+        content_txt:match("[Pp]roceeding")
+        or content_txt:match("[Ww]ill%s+read")
+        or content_txt:match("[Rr]eading")
+        or content_txt:match("[Ii]nspecting")
+        or content_txt:match("[Ww]ill%s+apply")
+        or content_txt:match("[Ww]ill%s+implement")
+      then
+        plan_cue = true
       end
 
       local should_resume = false
@@ -1312,31 +1331,23 @@ function chat.stream_ai_response(messages)
           if chat.chat_state._consecutive_silent_turns <= 5 then
             should_resume = true
             resume_reason = string.format("silent turn #%d after tools", chat.chat_state._consecutive_silent_turns)
-          else
-            log("chat: max silent retries (5) reached")
           end
         elseif plan_cue then
           chat.chat_state._plan_without_action_count = (chat.chat_state._plan_without_action_count or 0) + 1
           if chat.chat_state._plan_without_action_count <= 3 then
             should_resume = true
             resume_reason = string.format("plan-without-action #%d", chat.chat_state._plan_without_action_count)
-          else
-            log("chat: max plan-without-action retries (3) reached")
           end
         else
-          -- Reset counters if the assistant actually responded substantively
           chat.chat_state._consecutive_silent_turns = 0
           chat.chat_state._plan_without_action_count = 0
         end
       else
-        -- New: also resume on plan cues even when there was no recent tool turn
         if plan_cue then
           chat.chat_state._plan_without_action_count = (chat.chat_state._plan_without_action_count or 0) + 1
           if chat.chat_state._plan_without_action_count <= 2 then
             should_resume = true
             resume_reason = "plan-cue without recent tools"
-          else
-            log("chat: plan-cue retries exceeded (2) without recent tools")
           end
         else
           chat.chat_state._consecutive_silent_turns = 0
@@ -1345,11 +1356,8 @@ function chat.stream_ai_response(messages)
       end
 
       if should_resume then
-        -- Persist a snapshot for the UI only; avoid polluting the next request payload.
-        local content_txt = tostring(content or "")
         local meta = { response_time = os.time() - start_time, partial = true }
         local parts = {}
-
         if reason and reason ~= "" then
           table.insert(parts, "Reasoning:\n" .. reason)
         end
@@ -1362,15 +1370,9 @@ function chat.stream_ai_response(messages)
           table.insert(parts, "Reasoning summary:\n" .. reasoning_summary)
           meta.reasoning_summary = reasoning_summary
         end
-
-        local combined = table.concat(parts, "\n\n")
-        meta.display = combined
-
-        -- Store empty content so api.chat_messages_to_items omits this assistant turn,
-        -- keeping the next request free of interim reasoning/snapshot text.
+        meta.display = table.concat(parts, "\n\n")
         chat.add_message(MESSAGE_TYPES.ASSISTANT, "", meta)
         update_chat_display()
-
         log("chat: auto-resume (persisted partial) after %s", resume_reason)
         vim.schedule(function()
           if not chat.chat_state.streaming_active and not input_has_text() then
@@ -1380,21 +1382,16 @@ function chat.stream_ai_response(messages)
         return
       end
 
-      if silent then
-        log("chat: skip persisting empty assistant message")
-      end
-
       vim.schedule(function()
-        log("stream_ai_response: opening deferred reviews (if any)")
         maybe_open_deferred_reviews()
       end)
     end
   end, function(exit_code)
+    -- ON ERROR
     if has_completed then
       return
     end
     has_completed = true
-
     if not chat.chat_state.streaming_active then
       return
     end
@@ -1403,25 +1400,22 @@ function chat.stream_ai_response(messages)
     chat.chat_state.streaming_active = false
     stop_thinking_animation()
     local err_text = "AI error: " .. tostring(exit_code)
-    log("stream_ai_response: on_error | %s", tostring(exit_code))
     chat.add_message(MESSAGE_TYPES.ERROR, err_text, {})
     update_chat_display()
-    -- Also show a notification so the user is immediately aware
     vim.notify("NeoAI: " .. err_text, vim.log.levels.ERROR)
     disable_ctrl_c_cancel()
     if chat.chat_state._ts_suspended and chat.chat_state.buffers.chat then
       ts_resume(chat.chat_state.buffers.chat)
       chat.chat_state._ts_suspended = false
     end
-    -- Ensure any underlying job is terminated promptly
     pcall(function()
       require("neoai.api").cancel()
     end)
   end, function()
+    -- ON EXIT
     if not chat.chat_state.streaming_active then
       return
     end
-    log("stream_ai_response: end callback")
     safe_stop_and_close_timer(thinking_timeout_timer)
     chat.chat_state._timeout_timer = nil
   end)

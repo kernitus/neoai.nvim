@@ -8,7 +8,6 @@ import ai.koog.prompt.executor.clients.openai.OpenAIResponsesParams
 import ai.koog.prompt.llm.LLModel
 import ai.koog.prompt.message.Message
 import ai.koog.prompt.message.ResponseMetaInfo
-import ai.koog.prompt.params.LLMParams
 import ai.koog.prompt.streaming.StreamFrame
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.DefaultRequest
@@ -32,7 +31,6 @@ import kotlinx.serialization.json.JsonObject
 class FixedOpenAILLMClient(
     apiKey: String,
     private val settings: OpenAIClientSettings,
-    // ✅ CRITICAL: ignoreUnknownKeys must be true to handle 'sequence_number' and other new fields
     private val responseJson: Json =
         Json {
             ignoreUnknownKeys = true
@@ -46,6 +44,9 @@ class FixedOpenAILLMClient(
                 headers.append("Authorization", "Bearer $apiKey")
             }
         }
+
+    // Track mapping between ephemeral item_id and stable call_id
+    private val itemIdToCallId = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     override fun executeStreaming(
         prompt: Prompt,
@@ -113,9 +114,7 @@ class FixedOpenAILLMClient(
                             )
                         }
 
-                        else -> {
-                            null
-                        }
+                        else -> null
                     }
                 }
 
@@ -137,10 +136,9 @@ class FixedOpenAILLMClient(
                 )
 
             val requestBody = responseJson.encodeToString(request)
-            // DebugLogger.log(">>> REQUEST: $requestBody")
 
             var urlStr = settings.baseUrl.trimEnd('/')
-            if (!urlStr.endsWith("/responses") && !urlStr.contains("responses")) {
+            if (!urlStr.endsWith("/responses") && "responses" !in urlStr) {
                 urlStr = "$urlStr/responses"
             }
 
@@ -164,43 +162,49 @@ class FixedOpenAILLMClient(
                             val data = line.removePrefix("data: ").trim()
                             if (data != "[DONE]") {
                                 try {
-                                    // LOG RAW EVENT
+                                    // Log raw event for debugging
                                     DebugLogger.log("<<< EVENT: $data")
+
                                     val event = responseJson.decodeFromString<FixedStreamEvent>(data)
 
                                     when (event.type) {
-                                        // 1. Standard Content
                                         "response.output_text.delta" -> {
                                             if (event.delta != null) {
                                                 emit(StreamFrame.Append(event.delta))
                                             }
                                         }
 
-                                        // 2. Reasoning Summary (The part you want!)
                                         "response.reasoning_summary_text.delta" -> {
                                             if (event.delta != null) {
-                                                emit(StreamFrame.Append(event.delta))
+                                                // Tunnel reasoning through a special prefix
+                                                emit(StreamFrame.Append("|||REASONING|||${event.delta}"))
                                             }
                                         }
 
-                                        // 3. Reasoning Start Indicator
                                         "response.output_item.added" -> {
                                             val item = event.item
-                                            if (item != null && item.type == "reasoning") {
-                                                emit(StreamFrame.Append("\n> **Thinking...**\n> "))
+                                            // Map item.id to call_id for tool calls so we can track progress later
+                                            if (item?.id != null && item.callId != null) {
+                                                itemIdToCallId[item.id] = item.callId
                                             }
                                         }
 
-                                        // 4. Reasoning End Indicator
+                                        "response.function_call_arguments.delta" -> {
+                                            val itemId = event.itemId
+                                            val delta = event.delta
+                                            if (itemId != null && delta != null) {
+                                                val callId = itemIdToCallId[itemId] ?: "unknown"
+                                                val bytes = delta.length
+                                                // Emit progress heartbeat: |||TOOL_PROGRESS|||call_id|bytes
+                                                emit(StreamFrame.Append("|||TOOL_PROGRESS|||$callId|$bytes"))
+                                            }
+                                        }
+
+                                        // ✅ CRITICAL: This was missing. It finalises the tool call.
                                         "response.output_item.done" -> {
                                             val item = event.item
-                                            if (item != null && item.type == "reasoning") {
-                                                // Close the blockquote
-                                                emit(StreamFrame.Append("\n\n"))
-                                            }
-                                            // Tool Calls
                                             if (item != null && item.type == "function_call") {
-                                                DebugLogger.log("<<< TOOL CALL DETECTED: ${item.name}")
+                                                DebugLogger.log("<<< TOOL CALL COMPLETE: ${item.name}")
                                                 emit(
                                                     StreamFrame.ToolCall(
                                                         id = item.callId ?: "",
@@ -216,7 +220,7 @@ class FixedOpenAILLMClient(
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    DebugLogger.log("!!! PARSE ERROR: ${e.message} | DATA: $data")
+                                    DebugLogger.log("!!! PARSE ERROR: ${e.message}")
                                 }
                             }
                         }
@@ -224,8 +228,6 @@ class FixedOpenAILLMClient(
                 }
         }
     }
-
-    // --- DTOs ---
 
     @Serializable
     private data class FixedRequest(
@@ -246,6 +248,7 @@ class FixedOpenAILLMClient(
 
     @Serializable
     private data class FixedItem(
+        val id: String? = null,
         val type: String,
         val role: String? = null,
         val content: List<FixedContent>? = null,
@@ -272,8 +275,9 @@ class FixedOpenAILLMClient(
     @Serializable
     private data class FixedStreamEvent(
         val type: String,
-        // This 'delta' field captures text from both output_text.delta AND reasoning_summary_text.delta
         val delta: String? = null,
         val item: FixedItem? = null,
+        @SerialName("item_id") val itemId: String? = null
     )
 }
+

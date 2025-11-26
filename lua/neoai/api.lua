@@ -286,14 +286,13 @@ function api.cancel()
     end
     current_callbacks = nil
   end
-  -- Optionally notify daemon to cancel?
-  -- client:notify("cancel", {})
+  client:notify("cancel", {})
 end
 
--- Global callback invoked by the daemon
--- The daemon sends: nvim_call_function("NeoAI_OnChunk", [ {type="...", data="..."} ])
+-- -- Global callback invoked by the daemon
+-- The daemon sends: nvim_exec_lua("NeoAI_OnChunk(...)", [{ type="...", data=... }])
 function _G.NeoAI_OnChunk(chunk)
-  -- chunk is a table: { type="...", data="..." }
+  -- chunk is a table: { type = "...", data = ... }
   log("NeoAI_OnChunk: %s", vim.inspect(chunk))
 
   if not current_callbacks then
@@ -303,16 +302,8 @@ function _G.NeoAI_OnChunk(chunk)
   local t = chunk.type
   local d = chunk.data
 
-  if t == "content" or t == "reasoning" or t == "tool_call" then
-    if current_callbacks.on_chunk then
-      -- Schedule to ensure main thread safety if needed (rpc calls are usually safe but...)
-      vim.schedule(function()
-        if current_callbacks then
-          current_callbacks.on_chunk({ type = t, data = d })
-        end
-      end)
-    end
-  elseif t == "complete" then
+  -- 1. Terminal events are still handled specially
+  if t == "complete" then
     if current_callbacks.on_complete then
       vim.schedule(function()
         if current_callbacks then
@@ -321,6 +312,7 @@ function _G.NeoAI_OnChunk(chunk)
         end
       end)
     end
+    return
   elseif t == "error" then
     if current_callbacks.on_error then
       vim.schedule(function()
@@ -330,6 +322,17 @@ function _G.NeoAI_OnChunk(chunk)
         end
       end)
     end
+    return
+  end
+
+  -- 2. Everything else is forwarded as a streaming chunk
+  if current_callbacks.on_chunk then
+    vim.schedule(function()
+      if current_callbacks then
+        -- Preserve the existing {type=..., data=...} shape expected by chat.lua
+        current_callbacks.on_chunk({ type = t, data = d })
+      end
+    end)
   end
 end
 

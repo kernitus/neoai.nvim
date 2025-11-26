@@ -78,12 +78,12 @@ private val GPT5_1 = OpenAIModels.Chat.GPT5.copy(id = "gpt-5.1")
 
 object DebugLogger {
     private val file = java.io.File("/tmp/neoai-debug.log")
-    
+
     fun log(msg: String) {
         try {
             // Simple timestamped log
             file.appendText("[${java.time.LocalTime.now()}] $msg\n")
-        } catch (e: Exception) { 
+        } catch (e: Exception) {
             // Fail silently to avoid crashing the plugin
         }
     }
@@ -216,8 +216,12 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
                 requestLLMStreaming().collect { frame ->
                     when (frame) {
                         is StreamFrame.Append -> {
-                            textBuffer.append(frame.text)
+                            // Only append to history if it is NOT reasoning and NOT progress
+                            if (!frame.text.startsWith("|||REASONING|||") && !frame.text.startsWith("|||TOOL_PROGRESS|||")) {
+                                textBuffer.append(frame.text)
+                            }
                         }
+
                         is StreamFrame.ToolCall -> {
                             toolCalls.add(
                                 Message.Tool.Call(
@@ -228,6 +232,7 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
                                 )
                             )
                         }
+
                         is StreamFrame.End -> {}
                     }
                 }
@@ -261,20 +266,19 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
             }
         }
 
-        // ✅ FIXED LOGGING: Convert to Message first, then log
         val mapToolCallsToRequests by node<List<ReceivedToolResult>, List<Message.Request>> { input ->
             val messages = input.map { it.toMessage() }
-            
+
             messages.filterIsInstance<Message.Tool.Result>().forEach { msg ->
                 DebugLogger.log("✅ TOOL FINISHED: ${msg.tool} (ID: ${msg.id})")
                 DebugLogger.log("   -> Result Length: ${msg.content.length}")
                 DebugLogger.log("   -> Preview: ${msg.content.take(100).replace("\n", " ")}...")
-                
+
                 if (msg.content.isBlank()) {
                     DebugLogger.log("⚠️ WARNING: Tool returned EMPTY content!")
                 }
             }
-            
+
             messages
         }
 
@@ -306,7 +310,6 @@ fun main() = runBlocking {
                 break
             }
 
-            // Read the next value, expected to be an array
             val value = unpacker.unpackValue()
             if (!value.isArrayValue) {
                 continue
@@ -319,7 +322,7 @@ fun main() = runBlocking {
 
             val type = array[0].asIntegerValue().toInt()
 
-            if (type == 0) { // Request: [0, msgid, method, params]
+            if (type == 0) {
                 if (array.size() < 4) continue
                 val msgId = array[1].asIntegerValue().toInt()
                 val method = array[2].asStringValue().asString()
@@ -327,7 +330,7 @@ fun main() = runBlocking {
 
                 handleMethod(method, paramsArray, packer)
 
-            } else if (type == 2) { // Notification: [2, method, params]
+            } else if (type == 2) {
                 val method = array[1].asStringValue().asString()
                 val paramsArray = array[2].asArrayValue()
 
@@ -340,7 +343,6 @@ fun main() = runBlocking {
         }
     }
 
-    // Cleanup when main loop exits
     scope.cancel()
 }
 
@@ -357,7 +359,6 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
                 val map = paramValue.asMapValue()
                 val mapData = map.map()
 
-                // Helper to extract strings safely
                 fun getStr(key: String, default: String = ""): String {
                     val k = org.msgpack.value.ValueFactory.newString(key)
                     val v = mapData[k]
@@ -370,16 +371,12 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
                 val cwd = getStr("cwd", System.getProperty("user.dir") ?: ".")
                 val pluginRoot = getStr("plugin_root")
 
-                // --- Parsing Reasoning Effort (Nested) ---
                 var reasoningEffort: String? = null
-
-                // 1. Check for flat key first (backward compatibility)
                 val flatEffort = getStr("reasoning_effort")
                 if (flatEffort.isNotBlank()) {
                     reasoningEffort = flatEffort
                 }
 
-                // 2. Check nested: additional_kwargs -> reasoning -> effort
                 val kwargsKey = org.msgpack.value.ValueFactory.newString("additional_kwargs")
                 val kwargsVal = mapData[kwargsKey]
 
@@ -411,7 +408,7 @@ fun handleMethod(method: String, paramsArray: ArrayValue, packer: MessagePacker)
                     try {
                         generate(url, apiKey, model, reasoningEffort, body, cwd, pluginRoot, packer)
                     } catch (e: Exception) {
-                         DebugLogger.log("🔥 CRITICAL FAILURE in generate: ${e.message}")
+                        DebugLogger.log("🔥 CRITICAL FAILURE in generate: ${e.message}")
                         sendError("Generation failed: ${e.message}", packer)
                     }
                 }
@@ -458,19 +455,6 @@ suspend fun generate(
         return
     }
 
-    // 1. Instantiate tools first so we can read their descriptions
-    val readFileTool = CustomReadFileTool(JVMFileSystemProvider.ReadOnly, cwd)
-    val listDirTool = CustomListDirectoryTool<java.nio.file.Path>(cwd)
-    val editFileTool = CustomEditFileTool(JVMFileSystemProvider.ReadWrite, cwd)
-
-    val myTools = listOf(readFileTool, listDirTool, editFileTool)
-
-    // 2. Dynamically build the description string
-    val toolDescriptions = myTools.joinToString("\n") { tool ->
-        "- **${tool.name}**: ${tool.description}"
-    }
-
-    // 3. Prepare System Prompt
     val systemPromptFile = java.io.File(pluginRoot, "lua/neoai/prompts/system_prompt.md")
     if (!systemPromptFile.exists()) {
         sendError("System prompt file not found at: ${systemPromptFile.absolutePath}", packer)
@@ -479,15 +463,12 @@ suspend fun generate(
 
     val systemPrompt = try {
         val content = systemPromptFile.readText()
-        content
-            .replace("%tools", toolDescriptions) // ✅ Dynamic injection
-            .replace("%agents", "")
+        content.replace("{{agents}}", "")
     } catch (e: Exception) {
         sendError("Failed to read system prompt file: ${e.message}", packer)
         return
     }
 
-    // 4. Message Parsing
     val messages = mutableListOf<Message.Request>()
     val inputArray = inputVal.asArrayValue()
     for (i in 0 until inputArray.size()) {
@@ -519,6 +500,7 @@ suspend fun generate(
                 val v = cObj[k] ?: return null
                 return if (v.isStringValue) v.asStringValue().asString() else null
             }
+
             val cType = getContentString("type")
             val text = getContentString("text")
             if ((cType == "input_text" || cType == "output_text" || cType == "text") && !text.isNullOrBlank()) {
@@ -538,7 +520,11 @@ suspend fun generate(
         return
     }
 
-    // 5. Register the tools we created earlier
+    val readFileTool = CustomReadFileTool(JVMFileSystemProvider.ReadOnly, cwd)
+    val listDirTool = CustomListDirectoryTool<java.nio.file.Path>(cwd)
+    val editFileTool = CustomEditFileTool(JVMFileSystemProvider.ReadWrite, cwd)
+
+    val myTools = listOf(readFileTool, listDirTool, editFileTool)
     val toolRegistry = ToolRegistry {
         myTools.forEach { tool(it) }
     }
@@ -561,7 +547,7 @@ suspend fun generate(
             else -> ReasoningEffort.MEDIUM
         }
         OpenAIResponsesParams(
-            reasoning = ReasoningConfig(effort = effort, summary= ReasoningSummary.AUTO),
+            reasoning = ReasoningConfig(effort = effort, summary = ReasoningSummary.AUTO),
             toolChoice = ToolChoice.Auto
         )
     } else {
@@ -572,36 +558,54 @@ suspend fun generate(
         system(systemPrompt)
     }
 
-    // 2. Create the Agent with the config
     val agent = AIAgent(
         promptExecutor = executor,
         strategy = streamingWithToolsStrategy(reasoningParams),
         toolRegistry = toolRegistry,
-        
+
         agentConfig = AIAgentConfig(
-            maxAgentIterations = 150, 
-            model = model, 
-            prompt = promptObject 
+            maxAgentIterations = 150,
+            model = model,
+            prompt = promptObject
         ),
-        
+
         installFeatures = {
             handleEvents {
-                // 1. Streaming Events (Request Phase)
                 onLLMStreamingFrameReceived { context ->
                     when (val frame = context.streamFrame) {
                         is StreamFrame.Append -> {
-                            if (frame.text.isNotEmpty()) {
+                            if (frame.text.startsWith("|||REASONING|||")) {
+                                val cleanText = frame.text.removePrefix("|||REASONING|||")
+                                if (cleanText.isNotEmpty()) {
+                                    sendChunk("reasoning_summary", cleanText, packer)
+                                }
+                            } else if (frame.text.startsWith("|||TOOL_PROGRESS|||")) {
+                                // Format: |||TOOL_PROGRESS|||call_id|bytes
+                                val payload = frame.text.removePrefix("|||TOOL_PROGRESS|||")
+                                val parts = payload.split("|")
+                                if (parts.size >= 2) {
+                                    val callId = parts[0]
+                                    val bytes = parts[1].toIntOrNull() ?: 0
+                                    // Log that we are sending progress
+                                    DebugLogger.log(">> SENDING PROGRESS: $callId ($bytes bytes)")
+                                    sendToolProgress(callId, bytes, packer)
+                                } else {
+                                    DebugLogger.log("⚠️ MALFORMED PROGRESS: $payload")
+                                }
+                            } else if (frame.text.isNotEmpty()) {
                                 sendChunk("content", frame.text, packer)
                             }
                         }
+
                         is StreamFrame.ToolCall -> {
                             DebugLogger.log("⚡ UI NOTIFIED: Tool Call Request - ${frame.name}")
                             sendToolCall(frame.id, frame.name, frame.content, packer)
                         }
+
                         is StreamFrame.End -> {}
                     }
                 }
-                
+
                 onLLMStreamingFailed { context ->
                     DebugLogger.log("🔥 STREAM FAILED: ${context.error.message}")
                     sendError("Streaming failed: ${context.error.message}", packer)
@@ -619,22 +623,17 @@ suspend fun generate(
 }
 
 
-
 fun sendChunk(type: String, data: String, packer: MessagePacker) {
     synchronized(packer) {
-        // Notification: [2, "nvim_exec_lua", ["NeoAI_OnChunk(...)", [{type:..., data:...}]]]
-
         packer.packArrayHeader(3)
-        packer.packInt(2) // Notification type
+        packer.packInt(2)
         packer.packString("nvim_exec_lua")
 
-        packer.packArrayHeader(2) // [code, args]
+        packer.packArrayHeader(2)
         packer.packString("NeoAI_OnChunk(...)")
 
-        packer.packArrayHeader(1) // args array (1 arg)
+        packer.packArrayHeader(1)
 
-        // The arg is a map/struct: {type: "content", data: "..."}
-        // We can pack it as a map.
         packer.packMapHeader(2)
         packer.packString("type")
         packer.packString(type)
@@ -645,26 +644,46 @@ fun sendChunk(type: String, data: String, packer: MessagePacker) {
     }
 }
 
+fun sendToolProgress(callId: String, bytes: Int, packer: MessagePacker) {
+    synchronized(packer) {
+        packer.packArrayHeader(3)
+        packer.packInt(2)
+        packer.packString("nvim_exec_lua")
+        packer.packArrayHeader(2)
+        packer.packString("NeoAI_OnChunk(...)")
+        packer.packArrayHeader(1)
+
+        packer.packMapHeader(2)
+        packer.packString("type")
+        packer.packString("tool_progress")
+
+        packer.packString("data")
+        packer.packMapHeader(2)
+        packer.packString("id")
+        packer.packString(callId)
+        packer.packString("bytes")
+        packer.packInt(bytes)
+
+        packer.flush()
+    }
+}
+
 fun sendToolCall(id: String?, name: String, arguments: String, packer: MessagePacker) {
     synchronized(packer) {
-        // Notification: [2, "nvim_exec_lua", ["NeoAI_OnChunk(...)", [{type:"tool_call", data:{id:..., name:..., arguments:...}}]]]
-
         packer.packArrayHeader(3)
-        packer.packInt(2) // Notification type
+        packer.packInt(2)
         packer.packString("nvim_exec_lua")
 
-        packer.packArrayHeader(2) // [code, args]
+        packer.packArrayHeader(2)
         packer.packString("NeoAI_OnChunk(...)")
 
-        packer.packArrayHeader(1) // args array (1 arg)
+        packer.packArrayHeader(1)
 
-        // The arg is a map: {type: "tool_call", data: {id, name, arguments}}
         packer.packMapHeader(2)
         packer.packString("type")
         packer.packString("tool_call")
         packer.packString("data")
 
-        // Nested map for tool call data
         packer.packMapHeader(3)
         packer.packString("id")
         if (id != null) {
@@ -689,4 +708,3 @@ fun sendError(msg: String, packer: MessagePacker) {
     DebugLogger.log("❌ SENDING ERROR: $msg")
     sendChunk("error", msg, packer)
 }
-

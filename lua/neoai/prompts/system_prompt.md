@@ -65,14 +65,6 @@ When answering in English, you MUST use British English spelling, grammar, and p
 
 ---
 
-## 🛠️ Available Tools
-
-<tools>
-{{tools}}
-</tools>
-
----
-
 ## ⚙️ Tool Usage Principles
 
 - Your primary function is to use tools to solve the user's problem.
