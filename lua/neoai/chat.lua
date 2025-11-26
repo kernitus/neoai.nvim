@@ -1045,26 +1045,8 @@ function chat.get_tool_calls(tool_schemas)
   chat.chat_state._empty_turn_retry_used = false
   chat.chat_state._consecutive_silent_turns = 0
 
-  for _, sc in ipairs(tool_schemas or {}) do
-    local name = sc and sc["function"] and sc["function"].name or "<nil>"
-    log("chat.get_tool_calls: schema | idx=%s id=%s name=%s", tostring(sc and sc.index), tostring(sc and sc.id), name)
-  end
-  local summary = require("neoai.tool_runner").run_tool_calls(chat, tool_schemas)
-  log("chat.get_tool_calls: finished run_tool_calls")
-
-  -- Decide next step centrally: either present diffs now (if requested) or resume the model.
-  vim.schedule(function()
-    if summary and summary.request_review then
-      log("chat.get_tool_calls: PresentEdits requested; opening %d path(s)", #(summary.paths or {}))
-      maybe_open_deferred_reviews(summary and summary.paths or nil)
-      return
-    end
-
-    log("chat.get_tool_calls: no present request; resuming model turn")
-    chat.send_to_ai()
-  end)
-
-  return summary
+  -- Do not call neoai.tool_runner at all
+  return { request_review = false, paths = {} }
 end
 
 -- Format tools
@@ -1129,6 +1111,49 @@ function chat.stream_ai_response(messages)
     vim.api.nvim_buf_set_lines(bufnr, body_row0, -1, false, new_lines)
   end
 
+  -- Find a reasonable width for wrapping reasoning summary in the current chat window
+  local function get_chat_win_width()
+    if not (chat.chat_state and chat.chat_state.buffers and chat.chat_state.buffers.chat) then
+      return 80
+    end
+    local bufnr = chat.chat_state.buffers.chat
+    local width = 80
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(win) == bufnr then
+        local w = vim.api.nvim_win_get_width(win)
+        -- Leave a small margin for indentation
+        width = math.max(20, w - 4)
+        break
+      end
+    end
+    return width
+  end
+
+  -- Hard-wrap text to a given display width (by words where possible)
+  local function wrap_text_to_width(text, max_width)
+    local out = {}
+    -- First split on existing newlines
+    local raw_lines = vim.split(text or "", "\n", { plain = true })
+    for _, raw in ipairs(raw_lines) do
+      local line = raw
+      while vim.fn.strdisplaywidth(line) > max_width do
+        local cut = max_width
+        -- Move cut backwards to the previous whitespace if possible
+        while cut > 1 and not line:sub(cut, cut):match("%s") do
+          cut = cut - 1
+        end
+        if cut <= 1 then
+          cut = max_width
+        end
+        local head = line:sub(1, cut):gsub("%s+$", "")
+        table.insert(out, head)
+        line = line:sub(cut + 1):gsub("^%s+", "")
+      end
+      table.insert(out, line)
+    end
+    return out
+  end
+
   local function update_reasoning_overlay()
     if not (chat.chat_state and chat.chat_state.buffers and chat.chat_state.buffers.chat) then
       return
@@ -1154,10 +1179,21 @@ function chat.stream_ai_response(messages)
       return
     end
 
+    -- Compute wrapped lines for the current window width
+    local width = get_chat_win_width()
+    local wrapped_lines = wrap_text_to_width(reasoning_summary, width)
+
     local virt = {}
-    table.insert(virt, { { " Reasoning summary:", "Comment" } })
-    for _, ln in ipairs(vim.split(reasoning_summary, "\n", { plain = true })) do
-      table.insert(virt, { { "  " .. ln, "Comment" } })
+
+    -- Spacer line to separate from tool status / body
+    table.insert(virt, { { "", "Normal" } })
+
+    -- Header
+    table.insert(virt, { { " Reasoning summary:", "Title" } })
+
+    -- Body lines, wrapped and indented
+    for _, ln in ipairs(wrapped_lines) do
+      table.insert(virt, { { "  " .. ln, "Normal" } })
     end
 
     vim.api.nvim_buf_set_extmark(bufnr, reasoning_ns, header_row0, 0, {
@@ -1389,7 +1425,6 @@ function chat.stream_ai_response(messages)
       append_stream_text(cdata)
     elseif ctype == "reasoning" and cdata ~= "" then
       reason = reason .. cdata
-      --chat.update_streaming_message(reason, tostring(content), false, reasoning_summary)
     elseif ctype == "reasoning_summary" and cdata ~= "" then
       reasoning_summary = reasoning_summary .. cdata
       update_reasoning_overlay()
@@ -1652,80 +1687,6 @@ function chat.stream_ai_response(messages)
     safe_stop_and_close_timer(thinking_timeout_timer)
     chat.chat_state._timeout_timer = nil
   end)
-end
-
--- Update streaming display (shows reasoning and content as they arrive)
----@param reason string | nil
----@param content string | nil
----@param append boolean
----@param summary string | nil
-function chat.update_streaming_message(reason, content, append, summary)
-  if not chat.chat_state.is_open or not chat.chat_state.streaming_active then
-    return
-  end
-  local bufnr = chat.chat_state.buffers and chat.chat_state.buffers.chat or nil
-  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
-    return
-  end
-  local display = ""
-  -- Insert the thinking duration announcement (if any) at the very top, just once
-  local st_ = chat.chat_state and chat.chat_state.thinking or nil
-  if st_ and st_.announce_pending and st_.last_duration_str and st_.last_duration_str ~= "" then
-    display = display .. "Thought for " .. st_.last_duration_str .. "\n\n"
-    st_.announce_pending = false
-  end
-  -- Ensure the "Preparing tool calls…" status appears below already streamed text, while
-  -- keeping any general reasoning text (when present) above the content as before.
-  local prep_status
-  if type(reason) == "string" and reason:find("Preparing tool calls") then
-    -- Trim any leading newlines so spacing remains tidy when appended below.
-    prep_status = reason:gsub("^%s*\n+", "")
-    reason = nil
-  end
-
-  if reason and reason ~= "" then
-    display = display .. reason .. "\n\n"
-  end
-  if content and content ~= "" then
-    display = display .. tostring(content)
-  end
-
-  -- Stream reasoning summary below content when available
-  if summary and summary ~= "" then
-    if display ~= "" then
-      display = display .. "\n\n"
-    end
-    display = display .. "Reasoning summary:\n" .. summary
-  end
-
-  if prep_status and prep_status ~= "" then
-    if display ~= "" then
-      display = display .. "\n\n" .. prep_status
-    else
-      display = prep_status
-    end
-  end
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  for i = #lines, 1, -1 do
-    if lines[i]:match("^%*%*Assistant:%*%*") then
-      local new_lines = {}
-      for j = 1, i - 1 do
-        table.insert(new_lines, lines[j])
-      end
-      table.insert(new_lines, build_assistant_header(os.date("%Y-%m-%d %H:%M:%S")))
-
-      table.insert(new_lines, "")
-      for _, ln in ipairs(vim.split(display, "\n")) do
-        table.insert(new_lines, "  " .. ln)
-      end
-      table.insert(new_lines, "")
-      vim.api.nvim_buf_set_lines(bufnr, append and #lines or 0, -1, false, new_lines)
-      if chat.chat_state.config.auto_scroll then
-        scroll_to_bottom(bufnr)
-      end
-      break
-    end
-  end
 end
 
 -- Append content to current stream
