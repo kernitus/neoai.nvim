@@ -7,17 +7,13 @@ import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import java.io.File
 
-/**
- * Lists directory structure using ripgrep (respects .gitignore automatically).
- * Renders a visual tree to save tokens and improve readability.
- */
 class CustomListDirectoryTool<Path>(
     private val workingDirectory: String
 ) : Tool<CustomListDirectoryTool.Args, CustomListDirectoryTool.Result>() {
 
     @Serializable
     data class Args(
-        @property:LLMDescription("Path to the directory (relative paths supported, '.' for current directory)")
+        @property:LLMDescription("Relative path to the directory (Use '.' for current directory)")
         val path: String = ".",
         @property:LLMDescription("Maximum depth to display. Automatically adapts based on repository size.")
         val depth: Int = 3
@@ -31,23 +27,16 @@ class CustomListDirectoryTool<Path>(
 
     override val argsSerializer: KSerializer<Args> = Args.serializer()
     override val resultSerializer: KSerializer<Result> = Result.serializer()
-    override val name: String = "__list_directory__"
+    override val name: String = "list_directory"
     override val description: String = """
         Lists project structure using ripgrep (automatically respects .gitignore).
-        Skips node_modules, .git, and other ignored directories.
         
         Returns a visual tree representation.
-        
-        Working directory: $workingDirectory
     """.trimIndent()
 
     override suspend fun execute(args: Args): Result {
         // Resolve path
-        val targetPath = if (File(args.path).isAbsolute || args.path.startsWith("/")) {
-            args.path
-        } else {
-            File(workingDirectory, args.path).normalize().absolutePath
-        }
+        val targetPath = File(workingDirectory, args.path).normalize().absolutePath
 
         // Use ripgrep to get all files (respects .gitignore)
         val processBuilder = ProcessBuilder("rg", "--files", targetPath)

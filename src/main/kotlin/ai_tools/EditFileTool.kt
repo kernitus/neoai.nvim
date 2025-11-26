@@ -14,10 +14,6 @@ import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import java.io.File
 
-/**
- * Custom implementation of EditFileTool with built-in relative path support.
- * Uses Koog's patching logic (fuzzy matching) but implements the tool wrapper from scratch.
- */
 class CustomEditFileTool<Path>(
     private val fs: FileSystemProvider.ReadWrite<Path>,
     private val workingDirectory: String
@@ -25,7 +21,7 @@ class CustomEditFileTool<Path>(
 
     @Serializable
     data class Args(
-        @property:LLMDescription("Path to the file (relative paths supported). If it doesn't exist, it will be created.")
+        @property:LLMDescription("Relative path to the file. If it doesn't exist, it will be created.")
         val path: String,
         @property:LLMDescription("The exact text block to replace. Use empty string for new files or full rewrites.")
         val original: String,
@@ -45,23 +41,19 @@ class CustomEditFileTool<Path>(
     override val name: String = "edit_file"
     override val description: String = """
         Makes an edit to a target file by applying a single text replacement patch.
-        Supports both relative and absolute paths.
+        Works with paths relative to the current neovim project working directory.
         
         Key Requirements:
         - The 'original' text must match text in the file (whitespaces and line endings are fuzzy matched)
         - Only ONE replacement per tool call
         - Use empty string ("") for 'original' when creating new files or performing complete rewrites
-        
-        Relative paths are resolved against: $workingDirectory
     """.trimIndent()
 
     override suspend fun execute(args: Args): Result {
         // Resolve path
-        val absolutePath = if (File(args.path).isAbsolute || args.path.startsWith("/")) {
-            args.path
-        } else {
-            File(workingDirectory, args.path).normalize().absolutePath
-        }
+        // We keep the File reference to create directories later if needed
+        val fileHandle = File(workingDirectory, args.path).normalize()
+        val absolutePath = fileHandle.absolutePath
 
         val path = fs.fromAbsolutePathString(absolutePath)
 
@@ -81,19 +73,7 @@ class CustomEditFileTool<Path>(
         val patchApplyResult = applyTokenNormalisedPatch(content, patch)
 
         if (patchApplyResult.isSuccess()) {
-            // Ensure parent directory exists
-            // FileSystemProvider.writeText usually handles this or throws? 
-            // Koog's EditFileTool doesn't explicitly create parents, maybe writeText does?
-            // Let's assume writeText handles it or we might need to ensure parents.
-            // JVMFileSystemProvider uses java.nio.file.Files.writeString which might fail if parent doesn't exist.
-            // Let's check if we need to create directories.
-            // fs.createDirectories(fs.parent(path)) might be needed.
-            // But FileSystemProvider interface might not expose createDirectories directly in a simple way?
-            // Let's try writing. If it fails, we might need to fix.
-            // Actually, looking at Koog's EditFileTool source, it doesn't explicitly create directories.
-            // Wait, the description says "creating parent directories automatically if they don't exist".
-            // Maybe fs.writeText does it?
-            // Let's assume it does for now.
+            fileHandle.parentFile?.mkdirs()
 
             fs.writeText(path, patchApplyResult.updatedContent)
             return Result(applied = true, path = absolutePath)

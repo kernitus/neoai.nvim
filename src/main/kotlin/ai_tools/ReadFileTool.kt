@@ -11,10 +11,6 @@ import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import java.io.File
 
-/**
- * Custom implementation of ReadFileTool with built-in relative path support.
- * Completely standalone - does not delegate to Koog's ReadFileTool.
- */
 class CustomReadFileTool<Path>(
     private val fs: FileSystemProvider.ReadOnly<Path>,
     private val workingDirectory: String
@@ -22,7 +18,7 @@ class CustomReadFileTool<Path>(
 
     @Serializable
     data class Args(
-        @property:LLMDescription("Path to the text file (relative paths supported)")
+        @property:LLMDescription("Relative path to the text file")
         val path: String,
         @property:LLMDescription("First line to include (0-based, inclusive). Default is 0")
         val startLine: Int = 0,
@@ -39,25 +35,19 @@ class CustomReadFileTool<Path>(
 
     override val argsSerializer: KSerializer<Args> = Args.serializer()
     override val resultSerializer: KSerializer<Result> = Result.serializer()
-    override val name: String = "__read_file__"
+    override val name: String = "read_file"
     override val description: String = """
         Reads a text file with optional line range selection. TEXT-ONLY - never reads binary files.
-        Supports both relative and absolute paths.
+        Supports paths relative to the project current working directory.
         
         Use this to:
         - Read entire text files or specific line ranges
         - Get file content along with metadata
-        
-        Relative paths are resolved against: $workingDirectory
     """.trimIndent()
 
     override suspend fun execute(args: Args): Result {
         // Resolve path
-        val absolutePath = if (File(args.path).isAbsolute || args.path.startsWith("/")) {
-            args.path
-        } else {
-            File(workingDirectory, args.path).normalize().absolutePath
-        }
+        val absolutePath = File(workingDirectory, args.path).normalize().absolutePath
 
         // Get the path and metadata
         val path = fs.fromAbsolutePathString(absolutePath)
