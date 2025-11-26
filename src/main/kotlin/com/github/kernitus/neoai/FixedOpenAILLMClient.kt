@@ -59,6 +59,8 @@ class FixedOpenAILLMClient(
             return super.executeStreaming(prompt, model, tools)
         }
 
+        var reasoningSummaryStreamed = false
+
         return flow {
             val apiTools =
                 tools.map { tool ->
@@ -176,6 +178,7 @@ class FixedOpenAILLMClient(
 
                                         "response.reasoning_summary_text.delta" -> {
                                             if (event.delta != null) {
+                                                reasoningSummaryStreamed = true
                                                 // Tunnel reasoning through a special prefix
                                                 emit(StreamFrame.Append("|||REASONING|||${event.delta}"))
                                             }
@@ -200,7 +203,15 @@ class FixedOpenAILLMClient(
                                             }
                                         }
 
-                                        // ✅ CRITICAL: This was missing. It finalises the tool call.
+                                        "response.function_call_arguments.done" -> {
+                                            val itemId = event.itemId
+                                            if (itemId != null) {
+                                                val callId = itemIdToCallId[itemId] ?: "unknown"
+                                                // Tunnel a lightweight 'tool done' marker to the UI.
+                                                emit(StreamFrame.Append("|||TOOL_DONE|||$callId"))
+                                            }
+                                        }
+
                                         "response.output_item.done" -> {
                                             val item = event.item
                                             if (item != null && item.type == "function_call") {
@@ -216,6 +227,18 @@ class FixedOpenAILLMClient(
                                         }
 
                                         "response.completed" -> {
+                                            if (!reasoningSummaryStreamed) {
+                                                val fullSummary =
+                                                    event.response
+                                                        ?.output
+                                                        ?.firstOrNull { it.type == "reasoning" }
+                                                        ?.summary
+                                                        ?.joinToString(separator = "") { it.text.orEmpty() }
+
+                                                if (!fullSummary.isNullOrBlank()) {
+                                                    emit(StreamFrame.Append("|||REASONING|||$fullSummary"))
+                                                }
+                                            }
                                             emit(StreamFrame.End(null, ResponseMetaInfo.Empty))
                                         }
                                     }
@@ -277,7 +300,26 @@ class FixedOpenAILLMClient(
         val type: String,
         val delta: String? = null,
         val item: FixedItem? = null,
-        @SerialName("item_id") val itemId: String? = null
+        @SerialName("item_id") val itemId: String? = null,
+        val response: FixedResponse? = null,
+    )
+
+    @Serializable
+    private data class FixedResponse(
+        val output: List<FixedOutputItem> = emptyList(),
+    )
+
+    @Serializable
+    private data class FixedOutputItem(
+        val id: String,
+        val type: String,
+        val summary: List<FixedSummaryPart>? = null,
+    )
+
+    @Serializable
+    private data class FixedSummaryPart(
+        val type: String,
+        val text: String? = null,
     )
 }
 

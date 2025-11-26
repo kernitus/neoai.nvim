@@ -286,7 +286,6 @@ function api.cancel()
     end
     current_callbacks = nil
   end
-  client:notify("cancel", {})
 end
 
 -- -- Global callback invoked by the daemon

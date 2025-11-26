@@ -1042,7 +1042,6 @@ function chat.format_tools()
   return table.concat(names, ", ")
 end
 
--- Stream AI response
 function chat.stream_ai_response(messages)
   local log = require("neoai.debug").log
   log("stream_ai_response: entry | msgs=%d", #(messages or {}))
@@ -1062,12 +1061,63 @@ function chat.stream_ai_response(messages)
   local saw_first_token = false
   local has_completed = false
 
-  -- Timeout Configuration
-  local cfg = require("neoai.config").values.chat
-  local thinking_timeout_s = cfg.thinking_timeout or 300
-  local stall_timeout_s = cfg.stream_stall_timeout or 60
+  -- Render the aggregated per-tool byte counts for the current turn
+  local function render_tool_prep_status()
+    local per_call = {}
+    local total = 0
 
-  local current_timeout_limit = thinking_timeout_s
+    local function human_bytes(n)
+      if not n or n <= 0 then
+        return "0 B"
+      end
+      if n < 1024 then
+        return string.format("%d B", n)
+      end
+      if n < 1024 * 1024 then
+        return string.format("%.1f KB", n / 1024)
+      end
+      return string.format("%.1f MB", n / (1024 * 1024))
+    end
+
+    local arr = {}
+    for _, rec in pairs(tool_calls_by_id) do
+      table.insert(arr, rec)
+    end
+    table.sort(arr, function(a, b)
+      return (a.index or 0) < (b.index or 0)
+    end)
+
+    for _, tc in ipairs(arr) do
+      local idx = tc.index or 0
+      local name = (tc["function"] and tc["function"].name) or tc.name or "tool"
+      local b = tc.total_bytes or 0
+      total = total + b
+      local mark = tc.done and "✓" or "…"
+
+      -- Prefer a concise file path when we have one
+      local label = name
+      if tc.path and tc.path ~= "" then
+        label = string.format("%s (%s)", name, tc.path)
+      end
+
+      table.insert(per_call, string.format("%d. [%s] %s: %s", idx, mark, label, human_bytes(b)))
+    end
+
+    if #per_call == 0 then
+      return ""
+    end
+
+    local header = "Preparing tool calls…"
+    if total > 0 then
+      header = header .. string.format(" (received %s)", human_bytes(total))
+    end
+
+    return header .. "\n" .. table.concat(per_call, "\n")
+  end
+
+  -- Unified timeout (covers both 'thinking' before first token and stall afterwards)
+  local cfg = require("neoai.config").values.chat
+  local timeout_s = cfg.thinking_timeout or cfg.stream_stall_timeout or 300
 
   if chat.chat_state._timeout_timer then
     safe_stop_and_close_timer(chat.chat_state._timeout_timer)
@@ -1092,8 +1142,7 @@ function chat.stream_ai_response(messages)
     stop_thinking_animation()
     disable_ctrl_c_cancel()
 
-    local err_msg =
-      string.format("NeoAI: Timed out after %ds waiting for a response (stall detected).", current_timeout_limit)
+    local err_msg = string.format("NeoAI: Timed out after %ds waiting for a response (stall detected).", timeout_s)
 
     chat.add_message(MESSAGE_TYPES.ERROR, err_msg, { timeout = true })
     update_chat_display()
@@ -1107,8 +1156,8 @@ function chat.stream_ai_response(messages)
     require("neoai.api").cancel()
   end
 
-  -- Start the initial "Thinking" timer
-  thinking_timeout_timer:start(thinking_timeout_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+  -- Single timer handles both pre-first-token and stall timeout
+  thinking_timeout_timer:start(timeout_s * 1000, 0, vim.schedule_wrap(handle_timeout))
 
   local last_timer_reset = 0
 
@@ -1128,20 +1177,22 @@ function chat.stream_ai_response(messages)
       end
     end
 
-    -- TIMER MANAGEMENT
+    -- TIMER MANAGEMENT (single timeout)
     local now_ms = vim.loop.now()
 
     if not saw_first_token then
       saw_first_token = true
       capture_thinking_duration_for_announce()
-      current_timeout_limit = stall_timeout_s
+
+      -- Restart timer from the moment we see the first token
       thinking_timeout_timer:stop()
-      thinking_timeout_timer:start(stall_timeout_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+      thinking_timeout_timer:start(timeout_s * 1000, 0, vim.schedule_wrap(handle_timeout))
       last_timer_reset = now_ms
     else
+      -- Reset timer on every chunk, throttled to once per second
       if (now_ms - last_timer_reset) > 1000 then
         thinking_timeout_timer:stop()
-        thinking_timeout_timer:start(stall_timeout_s * 1000, 0, vim.schedule_wrap(handle_timeout))
+        thinking_timeout_timer:start(timeout_s * 1000, 0, vim.schedule_wrap(handle_timeout))
         last_timer_reset = now_ms
       end
     end
@@ -1161,88 +1212,124 @@ function chat.stream_ai_response(messages)
       local pid = cdata.id
       local pbytes = tonumber(cdata.bytes) or 0
 
-      -- FIX: Lazy initialize the tool entry if it doesn't exist yet
-      -- This handles the case where progress arrives before the definition
-      if pid and not tool_calls_by_id[pid] then
+      if not pid then
+        return
+      end
+
+      -- Lazy initialise entry so we do not depend on tool_calls arriving first
+      if not tool_calls_by_id[pid] then
         tool_calls_by_id[pid] = {
           id = pid,
+          index = #tool_calls_response + 1,
           type = "function",
-          ["function"] = { name = "tool", arguments = "" }, -- Placeholder name
+          ["function"] = { name = "tool", arguments = "" }, -- placeholder, updated later
+          name = "tool",
+          arguments = nil,
           total_bytes = 0,
         }
         table.insert(tool_calls_response, tool_calls_by_id[pid])
       end
 
-      if pid and tool_calls_by_id[pid] then
-        local t = tool_calls_by_id[pid]
-        t.total_bytes = (t.total_bytes or 0) + pbytes
+      local t = tool_calls_by_id[pid]
+      t.total_bytes = (t.total_bytes or 0) + pbytes
 
-        -- Re-render the status with the new byte counts
-        local function render_tool_prep_status()
-          local per_call = {}
-          local total = 0
-          local function human_bytes(n)
-            if not n or n <= 0 then
-              return "0 B"
-            end
-            if n < 1024 then
-              return string.format("%d B", n)
-            end
-            return string.format("%.1f KB", n / 1024)
-          end
-
-          local arr = {}
-          for _, rec in pairs(tool_calls_by_id) do
-            table.insert(arr, rec)
-          end
-          table.sort(arr, function(a, b)
-            return tostring(a.id) < tostring(b.id)
-          end)
-
-          for _, tc in ipairs(arr) do
-            local name = (tc["function"] and tc["function"].name) or (tc.type or "function")
-            local b = tc.total_bytes or 0
-            total = total + b
-            table.insert(per_call, string.format("- %s: %s", name, human_bytes(b)))
-          end
-
-          local header = "\nPreparing tool calls…"
-          if total > 0 then
-            header = header .. string.format(" (received %s)", human_bytes(total))
-          end
-          local body = table.concat(per_call, "\n")
-          return header .. (#body > 0 and ("\n" .. body) or "")
-        end
-
-        chat.update_streaming_message(render_tool_prep_status(), tostring(content or ""), false, reasoning_summary)
+      -- Re-render the status with the new byte counts (name may still be placeholder)
+      local status = render_tool_prep_status()
+      if status ~= "" then
+        -- We tunnel the status through the "reason" parameter; update_streaming_message
+        -- recognises "Preparing tool calls…" and renders it as a separate block.
+        chat.update_streaming_message(status, tostring(content or ""), false, reasoning_summary)
       end
     elseif ctype == "tool_calls" then
       local calls = type(cdata) == "table" and cdata or {}
 
-      for _, tc in ipairs(calls) do
-        local id = tc.id or tc.call_id
+      -- 1. Update / insert tool call records from this event
+      for _, call in ipairs(calls) do
+        local id = call.id or call.call_id
         if not id or id == "" then
           id = "unknown"
         end
 
+        local fn_name = (call["function"] and call["function"].name) or call.name or "tool"
+
+        local args = (call["function"] and call["function"].arguments) or call.arguments or ""
+
+        -- Try to extract a 'path' field from the JSON arguments for display
+        local display_path = nil
+        if args ~= "" then
+          local ok, decoded = pcall(vim.json.decode, args)
+          if ok and type(decoded) == "table" and type(decoded.path) == "string" then
+            display_path = decoded.path
+          end
+        end
+
         if not tool_calls_by_id[id] then
-          local fn_name = (tc["function"] and tc["function"].name) or tc.name or ""
           tool_calls_by_id[id] = {
             id = id,
+            index = #tool_calls_response + 1,
             type = "function",
-            ["function"] = { name = fn_name, arguments = "" },
+            ["function"] = { name = fn_name, arguments = args },
+            name = fn_name,
+            arguments = args,
+            path = display_path,
             total_bytes = 0,
+            done = false,
           }
           table.insert(tool_calls_response, tool_calls_by_id[id])
         else
-          -- FIX: Update the existing placeholder with the real name
+          -- Update existing placeholder with the real name and arguments
           local existing = tool_calls_by_id[id]
-          if tc["function"] and tc["function"].name then
-            existing["function"].name = tc["function"].name
+          existing.name = fn_name or existing.name
+          existing.arguments = args or existing.arguments
+          existing.path = display_path or existing.path
+          if existing["function"] then
+            existing["function"].name = fn_name or existing["function"].name
+            existing["function"].arguments = args or existing["function"].arguments
           end
-          if tc["function"] and tc["function"].arguments then
-            existing["function"].arguments = tc["function"].arguments
-          end
+        end
+      end
+
+      -- 2. Build a human-readable list of tool calls with arguments
+      local call_summaries = {}
+      local arr2 = {}
+      for _, rec in pairs(tool_calls_by_id) do
+        table.insert(arr2, rec)
+      end
+      table.sort(arr2, function(a, b)
+        return (a.index or 0) < (b.index or 0)
+      end)
+
+      for _, rec in ipairs(arr2) do
+        local name = rec.name or (rec["function"] and rec["function"].name) or "tool"
+        local args = rec.arguments or (rec["function"] and rec["function"].arguments) or ""
+        local preview = tostring(args):gsub("%s+", " ")
+        if #preview > 120 then
+          preview = preview:sub(1, 117) .. "..."
+        end
+        table.insert(call_summaries, string.format("%d. %s(%s)", rec.index or 0, name, preview))
+      end
+
+      if #call_summaries > 0 then
+        local extra = "Tool calls:\n" .. table.concat(call_summaries, "\n")
+        -- Append to the visible content area (under the assistant text)
+        chat.append_to_streaming_message(reason, tostring(content or ""), extra, reasoning_summary)
+      end
+
+      -- 3. Re-render the status panel now that names/args are known
+      local status = render_tool_prep_status()
+      if status ~= "" then
+        chat.update_streaming_message(status, tostring(content or ""), false, reasoning_summary)
+      end
+    elseif ctype == "tool_done" then
+      -- Mark a tool call as completed and re-render status
+      local pid = type(cdata) == "table" and cdata.id or cdata
+      if pid and tool_calls_by_id[pid] then
+        local t = tool_calls_by_id[pid]
+        t.done = true
+
+        local status = render_tool_prep_status()
+        if status ~= "" then
+          chat.update_streaming_message(status, tostring(content or ""), false, reasoning_summary)
         end
       end
     end

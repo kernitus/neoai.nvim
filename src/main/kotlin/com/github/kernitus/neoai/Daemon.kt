@@ -216,8 +216,10 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
                 requestLLMStreaming().collect { frame ->
                     when (frame) {
                         is StreamFrame.Append -> {
-                            // Only append to history if it is NOT reasoning and NOT progress
-                            if (!frame.text.startsWith("|||REASONING|||") && !frame.text.startsWith("|||TOOL_PROGRESS|||")) {
+                            if (!frame.text.startsWith("|||REASONING|||") &&
+                                !frame.text.startsWith("|||TOOL_PROGRESS|||") &&
+                                !frame.text.startsWith("|||TOOL_DONE|||")
+                            ) {
                                 textBuffer.append(frame.text)
                             }
                         }
@@ -592,6 +594,12 @@ suspend fun generate(
                                 } else {
                                     DebugLogger.log("⚠️ MALFORMED PROGRESS: $payload")
                                 }
+                            } else if (frame.text.startsWith("|||TOOL_DONE|||")) {
+                                val callId = frame.text.removePrefix("|||TOOL_DONE|||")
+                                if (callId.isNotBlank()) {
+                                    DebugLogger.log(">> SENDING TOOL_DONE: $callId")
+                                    sendToolDone(callId, packer)
+                                }
                             } else if (frame.text.isNotEmpty()) {
                                 sendChunk("content", frame.text, packer)
                             }
@@ -708,3 +716,25 @@ fun sendError(msg: String, packer: MessagePacker) {
     DebugLogger.log("❌ SENDING ERROR: $msg")
     sendChunk("error", msg, packer)
 }
+
+fun sendToolDone(callId: String, packer: MessagePacker) {
+    synchronized(packer) {
+        packer.packArrayHeader(3)
+        packer.packInt(2)                               // notification
+        packer.packString("nvim_exec_lua")
+        packer.packArrayHeader(2)
+        packer.packString("NeoAI_OnChunk(...)")         // Lua entrypoint
+        packer.packArrayHeader(1)
+
+        packer.packMapHeader(2)
+        packer.packString("type")
+        packer.packString("tool_done")
+        packer.packString("data")
+        packer.packMapHeader(1)
+        packer.packString("id")
+        packer.packString(callId)
+
+        packer.flush()
+    }
+}
+
