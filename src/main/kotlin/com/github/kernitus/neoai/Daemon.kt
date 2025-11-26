@@ -13,6 +13,7 @@ import ai.koog.prompt.message.ResponseMetaInfo
 import ai.koog.prompt.params.LLMParams
 import ai.koog.prompt.streaming.StreamFrame
 import io.ktor.client.HttpClient
+import ai.koog.agents.core.agent.config.AIAgentConfig
 import io.ktor.client.plugins.DefaultRequest
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.preparePost
@@ -212,7 +213,6 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
                 val textBuffer = StringBuilder()
                 val toolCalls = mutableListOf<Message.Tool.Call>()
 
-                // Collect frames to keep stream alive and capture data
                 requestLLMStreaming().collect { frame ->
                     when (frame) {
                         is StreamFrame.Append -> {
@@ -224,7 +224,7 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
                                     frame.id,
                                     frame.name,
                                     frame.content,
-                                    ResponseMetaInfo.Empty // ✅ Fixed: Added MetaInfo
+                                    ResponseMetaInfo.Empty
                                 )
                             )
                         }
@@ -238,16 +238,13 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
                     responses.add(
                         Message.Assistant(
                             textBuffer.toString(),
-                            ResponseMetaInfo.Empty // ✅ Fixed: Added MetaInfo
+                            ResponseMetaInfo.Empty
                         )
                     )
                 }
 
-                // ✅ Fixed: Ensure tool calls are returned to the graph
                 responses.addAll(toolCalls)
-
                 appendPrompt { messages(responses) }
-
                 responses
             }
         }
@@ -264,8 +261,21 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
             }
         }
 
+        // ✅ FIXED LOGGING: Convert to Message first, then log
         val mapToolCallsToRequests by node<List<ReceivedToolResult>, List<Message.Request>> { input ->
-            input.map { it.toMessage() }
+            val messages = input.map { it.toMessage() }
+            
+            messages.filterIsInstance<Message.Tool.Result>().forEach { msg ->
+                DebugLogger.log("✅ TOOL FINISHED: ${msg.tool} (ID: ${msg.id})")
+                DebugLogger.log("   -> Result Length: ${msg.content.length}")
+                DebugLogger.log("   -> Preview: ${msg.content.take(100).replace("\n", " ")}...")
+                
+                if (msg.content.isBlank()) {
+                    DebugLogger.log("⚠️ WARNING: Tool returned EMPTY content!")
+                }
+            }
+            
+            messages
         }
 
         edge(nodeStart forwardTo applyRequestToSession)
@@ -551,21 +561,32 @@ suspend fun generate(
             else -> ReasoningEffort.MEDIUM
         }
         OpenAIResponsesParams(
-            reasoning = ReasoningConfig(effort = effort),
+            reasoning = ReasoningConfig(effort = effort, summary= ReasoningSummary.AUTO),
             toolChoice = ToolChoice.Auto
         )
     } else {
         null
     }
 
+    val promptObject = Prompt.build("system_prompt") {
+        system(systemPrompt)
+    }
+
+    // 2. Create the Agent with the config
     val agent = AIAgent(
         promptExecutor = executor,
         strategy = streamingWithToolsStrategy(reasoningParams),
-        llmModel = model,
-        systemPrompt = systemPrompt,
         toolRegistry = toolRegistry,
+        
+        agentConfig = AIAgentConfig(
+            maxAgentIterations = 150, 
+            model = model, 
+            prompt = promptObject 
+        ),
+        
         installFeatures = {
             handleEvents {
+                // 1. Streaming Events (Request Phase)
                 onLLMStreamingFrameReceived { context ->
                     when (val frame = context.streamFrame) {
                         is StreamFrame.Append -> {
@@ -574,12 +595,15 @@ suspend fun generate(
                             }
                         }
                         is StreamFrame.ToolCall -> {
+                            DebugLogger.log("⚡ UI NOTIFIED: Tool Call Request - ${frame.name}")
                             sendToolCall(frame.id, frame.name, frame.content, packer)
                         }
                         is StreamFrame.End -> {}
                     }
                 }
+                
                 onLLMStreamingFailed { context ->
+                    DebugLogger.log("🔥 STREAM FAILED: ${context.error.message}")
                     sendError("Streaming failed: ${context.error.message}", packer)
                 }
             }

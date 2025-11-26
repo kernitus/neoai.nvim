@@ -58,7 +58,7 @@ class FixedOpenAILLMClient(
         }
 
         return flow {
-            // 1. Map Tools (Flattened)
+            // ... 1. Map Tools (Same as before) ...
             val apiTools =
                 tools.map { tool ->
                     FixedTool(
@@ -69,7 +69,7 @@ class FixedOpenAILLMClient(
                     )
                 }
 
-            // 2. Map Messages
+            // ... 2. Map Messages (Same as before) ...
             val inputItems: List<FixedItem> =
                 prompt.messages.mapNotNull { msg ->
                     when (msg) {
@@ -93,7 +93,6 @@ class FixedOpenAILLMClient(
                             FixedItem(
                                 type = "message",
                                 role = "assistant",
-                                // ✅ FIX: Use 'output_text' instead of 'text'
                                 content = listOf(FixedContent(type = "output_text", text = msg.content)),
                             )
                         }
@@ -121,22 +120,25 @@ class FixedOpenAILLMClient(
                     }
                 }
 
-            // 3. Construct Request
-            val request =
-                FixedRequest(
-                    model = model.id,
-                    input = inputItems,
-                    tools = apiTools,
-                    stream = true,
-                    toolChoice = "auto",
-                    maxOutputTokens = params.maxTokens,
-                    reasoning =
-                        params.reasoning?.let {
-                            FixedReasoning(effort = it.effort?.name?.lowercase() ?: "medium")
-                        },
-                )
+                        val request = FixedRequest(
+                model = model.id,
+                input = inputItems,
+                tools = apiTools,
+                stream = true,
+                toolChoice = "auto",
+                maxOutputTokens = params.maxTokens,
+                reasoning = params.reasoning?.let {
+                    FixedReasoning(
+                        effort = it.effort?.name?.lowercase() ?: "medium",
+                        summary = "auto" 
+                    )
+                }
+            )
 
             val requestBody = responseJson.encodeToString(request)
+
+            // LOG REQUEST
+            DebugLogger.log(">>> REQUEST: $requestBody")
 
             // 4. Execute Request
             var urlStr = settings.baseUrl.trimEnd('/')
@@ -152,6 +154,7 @@ class FixedOpenAILLMClient(
                 }.execute { response ->
                     if (response.status.value != 200) {
                         val err = response.bodyAsText()
+                        DebugLogger.log("!!! HTTP ERROR: ${response.status} - $err")
                         throw Exception("HTTP ${response.status}: $err")
                     }
 
@@ -163,6 +166,9 @@ class FixedOpenAILLMClient(
                             val data = line.removePrefix("data: ").trim()
                             if (data != "[DONE]") {
                                 try {
+                                    // LOG RAW EVENT
+                                    DebugLogger.log("<<< EVENT: $data")
+
                                     val event = responseJson.decodeFromString<FixedStreamEvent>(data)
 
                                     when (event.type) {
@@ -175,6 +181,7 @@ class FixedOpenAILLMClient(
                                         "response.output_item.done" -> {
                                             val item = event.item
                                             if (item != null && item.type == "function_call") {
+                                                DebugLogger.log("<<< TOOL CALL DETECTED: ${item.name}")
                                                 emit(
                                                     StreamFrame.ToolCall(
                                                         id = item.callId ?: "",
@@ -190,7 +197,7 @@ class FixedOpenAILLMClient(
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    // Ignore parsing errors
+                                    DebugLogger.log("!!! PARSE ERROR: ${e.message}")
                                 }
                             }
                         }
@@ -213,9 +220,10 @@ class FixedOpenAILLMClient(
     )
 
     @Serializable
-    private data class FixedReasoning(
-        val effort: String,
-    )
+private data class FixedReasoning(
+    val effort: String,
+    val summary: String? = null // Add this field
+)
 
     @Serializable
     private data class FixedItem(
