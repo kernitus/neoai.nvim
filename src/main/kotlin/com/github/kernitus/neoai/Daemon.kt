@@ -41,6 +41,7 @@ import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
 import ai.koog.prompt.message.RequestMetaInfo
 import com.github.kernitus.neoai.ai_tools.CustomReadFileTool
 import com.github.kernitus.neoai.ai_tools.CustomListDirectoryTool
+import com.github.kernitus.neoai.ai_tools.GrepTool
 import com.github.kernitus.neoai.ai_tools.CustomEditFileTool
 import ai.koog.agents.core.tools.ToolRegistry
 import ai.koog.prompt.llm.LLMProvider
@@ -524,9 +525,10 @@ suspend fun generate(
 
     val readFileTool = CustomReadFileTool(JVMFileSystemProvider.ReadOnly, cwd)
     val listDirTool = CustomListDirectoryTool<java.nio.file.Path>(cwd)
+    val grepTool = GrepTool(cwd)
     val editFileTool = CustomEditFileTool(JVMFileSystemProvider.ReadWrite, cwd)
 
-    val myTools = listOf(readFileTool, listDirTool, editFileTool)
+    val myTools = listOf(readFileTool, listDirTool, grepTool, editFileTool)
     val toolRegistry = ToolRegistry {
         myTools.forEach { tool(it) }
     }
@@ -566,7 +568,7 @@ suspend fun generate(
         toolRegistry = toolRegistry,
 
         agentConfig = AIAgentConfig(
-            maxAgentIterations = 150,
+            maxAgentIterations = 300,
             model = model,
             prompt = promptObject
         ),

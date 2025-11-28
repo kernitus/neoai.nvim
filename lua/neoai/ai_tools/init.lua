@@ -5,13 +5,11 @@ M.tool_schemas = {}
 
 -- List of tool modules to load
 local tool_names = {
-  "project_structure",
   "read",
   "treesitter_query",
   "symbol_index",
   "edit",
   "present",
-  "grep",
   "lsp_diagnostic",
   "lsp_code_action",
 }

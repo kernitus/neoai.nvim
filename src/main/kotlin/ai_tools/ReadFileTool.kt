@@ -37,13 +37,30 @@ class CustomReadFileTool<Path>(
     override val resultSerializer: KSerializer<Result> = Result.serializer()
     override val name: String = "read_file"
     override val description: String = """
-        Reads a text file with optional line range selection. TEXT-ONLY - never reads binary files.
-        Supports paths relative to the project current working directory.
-        
-        Use this to:
-        - Read entire text files or specific line ranges
-        - Get file content along with metadata
+        # WHEN TO USE THIS TOOL
+
+        - Use when you need to read the contents of a specific file.
+        - Helpful for examining source code, configuration files, or log files.
+        - Perfect for looking at text-based file formats.
+
+        # HOW TO USE
+
+        - Provide the `path` (relative to the current working directory).
+        - Optionally specify `startLine` to begin reading from a specific line (0-based, inclusive). Default is 0.
+        - Optionally specify `endLine` to stop reading (0-based, exclusive). Use -1 to read until the end of the file. Default is -1.
+
+        # FEATURES
+
+        - Reads from any specified line range in a file.
+        - Automatically detects non-text files and refuses to read them to prevent errors.
+        - Returns the total number of lines in the file along with the requested content.
+
+        # LIMITATIONS
+
+        - Cannot open files that do not exist or are inaccessible.
+        - Only reads text files; binary files or images cannot be read.
     """.trimIndent()
+
 
     override suspend fun execute(args: Args): Result {
         // Resolve path
