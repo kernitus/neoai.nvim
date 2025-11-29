@@ -1,21 +1,25 @@
-package com.github.kernitus.neoai.ai_tools.patch
+package com.github.kernitus.neoai.aiTools.patch
 
 import kotlinx.serialization.Serializable
 import kotlin.contracts.ExperimentalContracts
 import kotlin.contracts.contract
 
-internal fun applyTokenNormalisedPatch(content: String, patch: FilePatch): PatchApplyResult {
+internal fun applyTokenNormalisedPatch(
+    content: String,
+    patch: FilePatch,
+): PatchApplyResult {
     if (patch.isDelete || patch.isReplace) {
         val contentTokens = TokenList(tokenize(content))
         val originalTokens = TokenList(tokenize(patch.original))
 
-        val match = contentTokens.find(originalTokens) { fst, snd ->
-            if (fst.isWhitespace && snd.isWhitespace) {
-                true
-            } else {
-                fst.content.equals(snd.content, ignoreCase = true)
-            }
-        } ?: return PatchApplyResult.Failure.OriginalNotFound
+        val match =
+            contentTokens.find(originalTokens) { fst, snd ->
+                if (fst.isWhitespace && snd.isWhitespace) {
+                    true
+                } else {
+                    fst.content.equals(snd.content, ignoreCase = true)
+                }
+            } ?: return PatchApplyResult.Failure.OriginalNotFound
 
         val replacementTokens = TokenList(tokenize(patch.replacement))
         val updatedContent = contentTokens.replace(match, replacementTokens).text
@@ -32,19 +36,21 @@ internal fun applyTokenNormalisedPatch(content: String, patch: FilePatch): Patch
  */
 @Serializable
 public sealed interface PatchApplyResult {
-
     /**
      * Represents a successful patch application
      */
     @Serializable
-    public data class Success(val updatedContent: String) : PatchApplyResult
+    public data class Success(
+        val updatedContent: String,
+    ) : PatchApplyResult
 
     /**
      * Represents a failed patch application, including the reason for the failure
      */
     @Serializable
-    public sealed class Failure(public val reason: String) : PatchApplyResult {
-
+    public sealed class Failure(
+        public val reason: String,
+    ) : PatchApplyResult {
         /**
          * Represents a failure to find the original text in the file content
          */
@@ -53,7 +59,7 @@ public sealed interface PatchApplyResult {
             """
             The original text to replace was not found in the file content. 
             Consider re-reading the file to check if the original has changed since last read.
-            """
+            """,
         )
     }
 }
@@ -69,7 +75,7 @@ internal fun PatchApplyResult.isSuccess(): Boolean {
 
 internal fun tokenize(
     text: String,
-    separatorPattern: Regex = Regex("(\\r\\n|\\r|\\n)|[\\t ]+|[(){}\\[\\];,.:=<>/\\\\^$\"']")
+    separatorPattern: Regex = Regex("(\\r\\n|\\r|\\n)|[\\t ]+|[(){}\\[\\];,.:=<>/\\\\^$\"']"),
 ): List<Token> {
     val tokens = mutableListOf<Token>()
     var start = 0
@@ -86,12 +92,14 @@ internal fun tokenize(
     return tokens.filterNot { it.range.isEmpty() }
 }
 
-internal data class TokenList(val tokens: List<Token>) {
+internal data class TokenList(
+    val tokens: List<Token>,
+) {
     val text = tokens.joinToString("") { it.content }
 
     fun find(
         other: TokenList,
-        equals: (fst: Token, snd: Token) -> Boolean = { fst, snd -> fst.content == snd.content }
+        equals: (fst: Token, snd: Token) -> Boolean = { fst, snd -> fst.content == snd.content },
     ): IntRange? {
         outer@ for (i in 0..(tokens.size - other.tokens.size)) {
             for (j in other.tokens.indices) {
@@ -104,14 +112,17 @@ internal data class TokenList(val tokens: List<Token>) {
         return null
     }
 
-    fun replace(range: IntRange, replacement: TokenList): TokenList {
-        return TokenList(
-            tokens.subList(0, range.start) + replacement.tokens + tokens.subList(
-                range.endInclusive + 1,
-                this.tokens.size
-            )
+    fun replace(
+        range: IntRange,
+        replacement: TokenList,
+    ): TokenList =
+        TokenList(
+            tokens.subList(0, range.start) + replacement.tokens +
+                tokens.subList(
+                    range.endInclusive + 1,
+                    this.tokens.size,
+                ),
         )
-    }
 }
 
 /**

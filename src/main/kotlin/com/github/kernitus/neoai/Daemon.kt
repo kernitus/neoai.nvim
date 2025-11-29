@@ -39,10 +39,10 @@ import ai.koog.prompt.executor.clients.openai.models.ReasoningConfig
 import ai.koog.prompt.executor.clients.openai.models.ReasoningSummary
 import ai.koog.prompt.executor.llms.MultiLLMPromptExecutor
 import ai.koog.prompt.message.RequestMetaInfo
-import com.github.kernitus.neoai.ai_tools.CustomReadFileTool
-import com.github.kernitus.neoai.ai_tools.CustomListDirectoryTool
-import com.github.kernitus.neoai.ai_tools.GrepTool
-import com.github.kernitus.neoai.ai_tools.CustomEditFileTool
+import com.github.kernitus.neoai.aiTools.CustomReadFileTool
+import com.github.kernitus.neoai.aiTools.CustomListDirectoryTool
+import com.github.kernitus.neoai.aiTools.GrepTool
+import com.github.kernitus.neoai.aiTools.CustomEditFileTool
 import ai.koog.agents.core.tools.ToolRegistry
 import ai.koog.prompt.llm.LLMProvider
 import ai.koog.agents.core.agent.AIAgent
@@ -627,8 +627,10 @@ suspend fun generate(
     try {
         agent.run(messages)
         sendComplete(packer)
-    } catch (e: Exception) {
-        sendError("Agent execution failed: ${e.message}", packer)
+    } catch (e: Throwable) {
+        val errorMsg = "CRITICAL JVM ERROR: ${e.message}\n${e.stackTraceToString()}"
+        DebugLogger.log(errorMsg)
+        sendError(errorMsg, packer)
     }
 }
 

@@ -169,7 +169,7 @@ config.defaults = {
         main = {
           url = "https://api.openai.com/v1/responses",
           api_key = os.getenv("OPENAI_API_KEY"),
-          model = "gpt-5",
+          model = "gpt-5.1-codex",
           max_output_tokens = 128000,
           additional_kwargs = {
             temperature = 1,
@@ -186,7 +186,7 @@ config.defaults = {
           additional_kwargs = {
             temperature = 1,
             reasoning = {
-              effort = "low",
+              effort = "minimal",
             },
           },
         },

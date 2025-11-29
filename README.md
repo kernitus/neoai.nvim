@@ -55,6 +55,8 @@ The assistant will favour TreeSitterQuery over Grep or LSP actions unless the us
 
 ### Using lazy.nvim
 
+Use a single lazy.nvim spec that wires everything together: dependencies, Kotlin build automation via both `build` and `init`, and a setup call that keeps the model settings aligned with `lua/neoai/config.lua` (the canonical source of truth for presets).
+
 ```lua
 {
   "nvim-neoai/neoai.nvim",
@@ -63,122 +65,82 @@ The assistant will favour TreeSitterQuery over Grep or LSP actions unless the us
     "nvim-telescope/telescope.nvim",
     "nvim-treesitter/nvim-treesitter", -- optional, recommended for TreeSitterQuery
   },
-  config = function()
-    require("neoai").setup({
-      preset = "openai",      -- or "groq", "anthropic", "ollama"
-      api = {
-        main = { api_key = "YOUR_API_KEY" },
-        small = { api_key = "YOUR_API_KEY" },
-      },
-    })
+  build = "./gradlew shadowJar",
+  init = function(plugin)
+    -- Ensure the Kotlin sidecar (src/main/kotlin) is rebuilt whenever Neovim starts
+    vim.fn.jobstart({ "bash", "-c", "cd " .. plugin.dir .. " && ./gradlew shadowJar" }, { detach = true })
   end,
-}
-```
-
-### Using packer.nvim
-
-```lua
-use {
-  "nvim-neoai/neoai.nvim",
-  requires = { "nvim-lua/plenary.nvim", "nvim-telescope/telescope.nvim", "nvim-treesitter/nvim-treesitter" },
   config = function()
     require("neoai").setup({
+      -- Defer to lua/neoai/config.lua for canonical presets and override only what you must.
       preset = "openai",
       api = {
-        main = { api_key = "YOUR_API_KEY" },
-        small = { api_key = "YOUR_API_KEY" },
+        main = {
+          api_key = os.getenv("OPENAI_API_KEY"),
+          model = "gpt-5.1-codex",
+          max_output_tokens = 128000,
+          additional_kwargs = {
+            reasoning = { effort = "medium" },
+          },
+        },
+        small = {
+          api_key = os.getenv("OPENAI_API_KEY"),
+          model = "gpt-5-mini",
+          max_output_tokens = 128000,
+          additional_kwargs = {
+            reasoning = { effort = "minimal" },
+          },
+        },
       },
     })
   end,
 }
 ```
+
+The `build` key runs Gradle after installs/updates, whilst the `init` callback re-runs `./gradlew shadowJar` during Neovim start-up so the Kotlin companion jar stays aligned with local edits. When in doubt, inspect `lua/neoai/config.lua` for the latest model defaults and preset overrides.
 
 ### Required dependencies
 
 - ripgrep (rg): required for the Grep and Project Structure tools.
 - nvim-treesitter: For TreeSitterQuery and edit tool; ensure language parsers are installed (e.g., `:TSInstall lua`).
 
-Note on models:
+Note on models and presets:
 
 - Both `api.main` and `api.small` must be configured (URLs, API keys, and model names).
+- The default preset in `lua/neoai/config.lua` uses `gpt-5.1-codex` (reasoning effort "medium") for `api.main` and `gpt-5-mini` (reasoning effort "minimal") for `api.small`, each with `max_output_tokens = 128000`. Always consult `lua/neoai/config.lua` for the definitive defaults.
 
 ## Configuration
 
-- Call `require('neoai').setup(opts)` with any of the following options:
+Call `require('neoai').setup(opts)` and only override what differs from the canonical defaults in `lua/neoai/config.lua`. The preset table there (especially `config.defaults.presets.openai`) is the definitive source for bundled values.
+
+Key reminders:
+
+- Configure two labelled API profiles: `api.main` (default `gpt-5.1-codex`, reasoning effort "medium") and `api.small` (default `gpt-5-mini`, reasoning effort "minimal"). Both have `max_output_tokens = 128000`.
+- Point `build`/`init` hooks at `./gradlew shadowJar` if you are loading the plugin via lazy.nvim or another manager; this keeps the Kotlin companion jar aligned with local Kotlin sources under `src/main/kotlin`.
+- Override chat/keymap/storage settings as needed, but when documenting or scripting changes, validate them against `lua/neoai/config.lua` to avoid drift.
+
+Minimal example showcasing environment-provided keys and custom storage path:
 
 ```lua
-require("neoai").setup({
-  -- Select a built-in preset (openai, groq, anthropic, ollama) or omit for custom
-  preset = "openai",
-
-  -- Configure TWO labelled API profiles (required): main and small
-  api = {
-    main = {
-      url     = "https://api.openai.com/v1/chat/completions",
-      api_key = "YOUR_API_KEY",
-      model   = "gpt-4",
-      max_completion_tokens  = 4096,
-      api_key_header         = "Authorization",
-      api_key_format         = "Bearer %s",
-    },
-    small = {
-      url     = "https://api.openai.com/v1/chat/completions",
-      api_key = "YOUR_API_KEY",
-      model   = "gpt-4o-mini",
-      max_completion_tokens  = 4096,
-      api_key_header         = "Authorization",
-      api_key_format         = "Bearer %s",
-    },
-  },
-
-  -- Chat UI settings
-  chat = {
-    window = { width = 80 },
-    auto_scroll = true,
-
-    -- Storage settings (multi-session features)
-    database_path = vim.fn.stdpath("data") .. "/neoai.json",
-  },
-
-  -- Override default keymaps (see lua/neoai/config.lua for defaults)
-  keymaps = {
-    normal = {
-      open          = "<leader>ai",
-      toggle        = "<leader>at",
-      clear_history = "<leader>ac",
-    },
-    input = {
-      file_picker  = "@@",    -- insert file path (double-at trigger)
-      send_message = "<CR>",
-      close        = "<C-c>",
-    },
-    chat = {
-      close        = {"<C-c>", "q"},
-    },
-    -- `telescope`, `default`
-    session_picker = "default"  },
-})
-```
-
-- Multiple models config (required)
-  - You must configure two labelled models under `api`: `main` and `small`.
-  - Current behaviour: the plugin uses the `main` model internally. The `small` model is reserved for upcoming features.
-
-```lua
-local OPENAI_API_KEY = require("config.env").OPENAI_API_KEY
+local api_key = os.getenv("OPENAI_API_KEY")
 require("neoai").setup({
   preset = "openai",
   api = {
     main = {
-      api_key = OPENAI_API_KEY,
-      model = "gpt-5",
-      max_completion_tokens = 128000,
-      additional_kwargs = { reasoning_effort = "medium" },
+      api_key = api_key,
+      model = "gpt-5.1-codex",
+      max_output_tokens = 128000,
+      additional_kwargs = {
+        reasoning = { effort = "medium" },
+      },
     },
     small = {
-      api_key = OPENAI_API_KEY,
+      api_key = api_key,
       model = "gpt-5-mini",
-      max_completion_tokens = 128000,
+      max_output_tokens = 128000,
+      additional_kwargs = {
+        reasoning = { effort = "minimal" },
+      },
     },
   },
   chat = {
@@ -186,6 +148,22 @@ require("neoai").setup({
   },
 })
 ```
+
+Because presets can evolve (e.g., switching providers or models during the Kotlin migration), always treat `lua/neoai/config.lua` as the single source of truth.
+
+## Kotlin sidecar build
+
+Parts of NeoAI.nvim now run on a Kotlin helper that ships as a shaded jar. Whenever you pull updates or edit any Kotlin source under `src/main/kotlin`, run the following from the project root:
+
+```bash
+./gradlew shadowJar
+```
+
+If you launch Neovim via a plugin manager (lazy.nvim, packer, etc.), add a post-update hook to run this command so the embedded jar stays in sync. The Neovim plugin will look for the generated artefact under `build/libs/`.
+
+### Automate the build via `init`
+
+You can ask your plugin manager to run `./gradlew shadowJar` from the plugin’s directory every time it initialises, ensuring the Kotlin sidecar is always current. See the lazy.nvim specification above for a single example that combines dependencies, build hooks, Kotlin automation, and model configuration.
 
 ## Persistent Storage Options
 

@@ -1,4 +1,4 @@
-package com.github.kernitus.neoai.ai_tools
+package com.github.kernitus.neoai.aiTools
 
 import ai.koog.agents.core.tools.Tool
 import ai.koog.agents.core.tools.annotations.LLMDescription
@@ -8,27 +8,27 @@ import kotlinx.serialization.Serializable
 import java.io.File
 
 class CustomListDirectoryTool<Path>(
-    private val workingDirectory: String
+    private val workingDirectory: String,
 ) : Tool<CustomListDirectoryTool.Args, CustomListDirectoryTool.Result>() {
-
     @Serializable
     data class Args(
         @property:LLMDescription("Relative path to the directory (Use '.' for current directory)")
         val path: String = ".",
         @property:LLMDescription("Maximum depth to display. Automatically adapts based on repository size.")
-        val depth: Int = 3
+        val depth: Int = 3,
     )
 
     @Serializable
     data class Result(
         val output: String, // The rendered visual tree
-        val totalFiles: Int
+        val totalFiles: Int,
     )
 
     override val argsSerializer: KSerializer<Args> = Args.serializer()
     override val resultSerializer: KSerializer<Result> = Result.serializer()
     override val name: String = "list_directory"
-    override val description: String = """
+    override val description: String =
+        """
         # WHEN TO USE THIS TOOL
 
         - Use when you need to inspect and return the directory tree of a given path.
@@ -53,8 +53,7 @@ class CustomListDirectoryTool<Path>(
 
         - May still be slow on extremely large monorepos (bounded by ripgrep speed).
         - Only returns a textual tree (not a structured object).
-    """.trimIndent()
-
+        """.trimIndent()
 
     override suspend fun execute(args: Args): Result {
         // Resolve path
@@ -78,16 +77,21 @@ class CustomListDirectoryTool<Path>(
         if (files.isEmpty()) {
             return Result(
                 output = "No files found in '$targetPath' (respecting .gitignore).",
-                totalFiles = 0
+                totalFiles = 0,
             )
         }
 
         // Determine effective depth based on repo size
-        val effectiveDepth = when {
-            files.size <= 50 -> 999 // Show everything for small repos
-            files.size >= 400 -> minOf(args.depth, 2) // Clamp for large repos
-            else -> args.depth
-        }
+        val effectiveDepth =
+            when {
+                files.size <= 50 -> 999
+
+                // Show everything for small repos
+                files.size >= 400 -> minOf(args.depth, 2)
+
+                // Clamp for large repos
+                else -> args.depth
+            }
 
         // Build tree from file list
         val rootMap = buildMapFromFiles(files, targetPath)
@@ -105,11 +109,14 @@ class CustomListDirectoryTool<Path>(
 
         return Result(
             output = sb.toString(),
-            totalFiles = files.size
+            totalFiles = files.size,
         )
     }
 
-    private fun buildMapFromFiles(files: List<String>, basePath: String): Map<String, Any> {
+    private fun buildMapFromFiles(
+        files: List<String>,
+        basePath: String,
+    ): Map<String, Any> {
         val root = mutableMapOf<String, Any>()
 
         for (file in files) {
@@ -138,12 +145,15 @@ class CustomListDirectoryTool<Path>(
         sb: StringBuilder,
         prefix: String,
         currentDepth: Int,
-        maxDepth: Int
+        maxDepth: Int,
     ) {
-        val keys = node.keys.sortedWith(compareBy<String> { key ->
-            // Directories first, then files
-            if (node[key] is Boolean) 1 else 0
-        }.thenBy { it })
+        val keys =
+            node.keys.sortedWith(
+                compareBy<String> { key ->
+                    // Directories first, then files
+                    if (node[key] is Boolean) 1 else 0
+                }.thenBy { it },
+            )
 
         for ((index, key) in keys.withIndex()) {
             val value = node[key]

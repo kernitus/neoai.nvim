@@ -1,4 +1,4 @@
-package com.github.kernitus.neoai.ai_tools
+package com.github.kernitus.neoai.aiTools
 
 import ai.koog.agents.core.tools.Tool
 import ai.koog.agents.core.tools.annotations.LLMDescription
@@ -13,9 +13,8 @@ import java.io.File
 
 class CustomReadFileTool<Path>(
     private val fs: FileSystemProvider.ReadOnly<Path>,
-    private val workingDirectory: String
+    private val workingDirectory: String,
 ) : Tool<CustomReadFileTool.Args, CustomReadFileTool.Result>() {
-
     @Serializable
     data class Args(
         @property:LLMDescription("Relative path to the text file")
@@ -30,13 +29,14 @@ class CustomReadFileTool<Path>(
     data class Result(
         val path: String,
         val content: String,
-        val totalLines: Int
+        val totalLines: Int,
     )
 
     override val argsSerializer: KSerializer<Args> = Args.serializer()
     override val resultSerializer: KSerializer<Result> = Result.serializer()
     override val name: String = "read_file"
-    override val description: String = """
+    override val description: String =
+        """
         # WHEN TO USE THIS TOOL
 
         - Use when you need to read the contents of a specific file.
@@ -59,8 +59,7 @@ class CustomReadFileTool<Path>(
 
         - Cannot open files that do not exist or are inaccessible.
         - Only reads text files; binary files or images cannot be read.
-    """.trimIndent()
-
+        """.trimIndent()
 
     override suspend fun execute(args: Args): Result {
         // Resolve path
@@ -68,9 +67,10 @@ class CustomReadFileTool<Path>(
 
         // Get the path and metadata
         val path = fs.fromAbsolutePathString(absolutePath)
-        val metadata = validateNotNull(fs.metadata(path)) {
-            "File not found: $absolutePath"
-        }
+        val metadata =
+            validateNotNull(fs.metadata(path)) {
+                "File not found: $absolutePath"
+            }
 
         validate(metadata.type == FileMetadata.FileType.File) {
             "Not a file: $absolutePath"
@@ -103,7 +103,7 @@ class CustomReadFileTool<Path>(
         return Result(
             path = absolutePath,
             content = content,
-            totalLines = totalLines
+            totalLines = totalLines,
         )
     }
 }
