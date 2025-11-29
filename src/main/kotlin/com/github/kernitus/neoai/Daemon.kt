@@ -90,6 +90,35 @@ object DebugLogger {
     }
 }
 
+private const val AGENTS_PLACEHOLDER = "{{agents}}"
+
+private fun loadAgentsFile(projectDir: String): String? {
+    if (projectDir.isBlank()) return null
+    val directory = java.io.File(projectDir)
+    if (!directory.exists() || !directory.isDirectory) {
+        return null
+    }
+
+    val agentsFile = directory.listFiles()?.firstOrNull { file ->
+        file.isFile && file.name.equals("agents.md", ignoreCase = true)
+    } ?: return null
+
+    return try {
+        agentsFile.readText()
+    } catch (e: Exception) {
+        DebugLogger.log("Failed to read ${agentsFile.absolutePath}: ${e.message}")
+        null
+    }
+}
+
+private fun injectAgentsContent(promptTemplate: String, agentsContent: String?): String {
+    if (!promptTemplate.contains(AGENTS_PLACEHOLDER)) {
+        return promptTemplate
+    }
+
+    val replacement = agentsContent?.trim()?.takeIf { it.isNotBlank() } ?: ""
+    return promptTemplate.replace(AGENTS_PLACEHOLDER, replacement)
+}
 
 private fun pickModel(name: String): ai.koog.prompt.llm.LLModel {
     return when (name.lowercase()) {
@@ -466,7 +495,8 @@ suspend fun generate(
 
     val systemPrompt = try {
         val content = systemPromptFile.readText()
-        content.replace("{{agents}}", "")
+        val agentsContent = loadAgentsFile(cwd)
+        injectAgentsContent(content, agentsContent)
     } catch (e: Exception) {
         sendError("Failed to read system prompt file: ${e.message}", packer)
         return
