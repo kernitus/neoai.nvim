@@ -2,6 +2,10 @@
 
 A powerful AI-enhanced chat interface for Neovim, featuring streaming responses, multi-session support, intelligent file operations, and advanced LSP integration. Inspired by Cline and Kilo VSCode extensions.
 
+## Philosophy
+
+NeoAI.nvim is inspired by Avante.nvim but focuses relentlessly on doing one thing exceptionally well: empowering agentic coding workflows inside Neovim without scope creep. We intentionally keep the plugin surface area as small and comprehensible as possible whilst still delivering sophisticated automation. Every feature is evaluated against simplicity, clarity, and speed. The Kotlin companion leverages advanced coroutine-based asyncio patterns in tandem with Neovim's native capabilities to stay fast and responsive, ensuring the assistant never slows you down.
+
 ## Features
 
 - **Multi-Session Support**: Create, switch, rename, and delete multiple chat sessions
