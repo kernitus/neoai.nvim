@@ -8,8 +8,7 @@ import ai.koog.rag.base.files.FileSystemProvider
 import ai.koog.rag.base.files.readText
 import ai.koog.rag.base.files.writeText
 import com.github.kernitus.neoai.aiTools.patch.FilePatch
-import com.github.kernitus.neoai.aiTools.patch.applyTokenNormalisedPatch
-import com.github.kernitus.neoai.aiTools.patch.isSuccess
+import com.github.kernitus.neoai.aiTools.patch.applyBatchPatches
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import java.io.File
@@ -22,17 +21,26 @@ class CustomEditFileTool<Path>(
     data class Args(
         @property:LLMDescription("Relative path to the file. If it doesn't exist, it will be created.")
         val path: String,
-        @property:LLMDescription("The exact text block to replace. Use empty string for new files or full rewrites.")
+        @property:LLMDescription(
+            "List of edit operations to apply to this file. The engine applies them order-invariantly and resolves overlaps.",
+        )
+        val edits: List<EditOperation>,
+    )
+
+    @Serializable
+    data class EditOperation(
+        @property:LLMDescription("The exact text block to replace. Use empty string to insert at beginning of file.")
         val original: String,
-        @property:LLMDescription("The new text content that will replace the original text block.")
+        @property:LLMDescription("The new text content.")
         val replacement: String,
     )
 
     @Serializable
     data class Result(
-        val applied: Boolean,
-        val reason: String? = null,
+        val appliedCount: Int,
+        val skippedCount: Int,
         val path: String,
+        val message: String,
     )
 
     override val argsSerializer: KSerializer<Args> = Args.serializer()
@@ -40,21 +48,19 @@ class CustomEditFileTool<Path>(
     override val name: String = "edit_file"
     override val description: String =
         """
-        Makes an edit to a target file by applying a single text replacement patch.
+        Makes edits to a target file by applying text replacement patches.
         Works with paths relative to the current neovim project working directory.
         
         Key Requirements:
-        - The 'original' text must match text in the file (whitespaces and line endings are fuzzy matched)
-        - Only ONE replacement per tool call
-        - Use empty string ("") for 'original' when creating new files or performing complete rewrites
+        - The 'original' text must match text in the file (whitespaces and line endings are fuzzy matched).
+        - You can provide multiple edits in one call.
+        - Use empty string ("") for 'original' to insert text at the beginning of the file.
         """.trimIndent()
 
     override suspend fun execute(args: Args): Result {
         // Resolve path
-        // We keep the File reference to create directories later if needed
         val fileHandle = File(workingDirectory, args.path).normalize()
         val absolutePath = fileHandle.absolutePath
-
         val path = fs.fromAbsolutePathString(absolutePath)
 
         // Check if file exists and is text
@@ -68,17 +74,31 @@ class CustomEditFileTool<Path>(
         // Read content (empty if new file)
         val content = if (fs.exists(path)) fs.readText(path) else ""
 
-        // Apply patch
-        val patch = FilePatch(args.original, args.replacement)
-        val patchApplyResult = applyTokenNormalisedPatch(content, patch)
+        // Convert Args to internal FilePatch objects
+        val patches = args.edits.map { FilePatch(it.original, it.replacement) }
 
-        if (patchApplyResult.isSuccess()) {
+        // Apply patches using the multi-pass batch logic
+        val result = applyBatchPatches(content, patches)
+
+        if (result.appliedCount > 0 || result.finalContent != content) {
             fileHandle.parentFile?.mkdirs()
-
-            fs.writeText(path, patchApplyResult.updatedContent)
-            return Result(applied = true, path = absolutePath)
-        } else {
-            return Result(applied = false, reason = patchApplyResult.reason, path = absolutePath)
+            fs.writeText(path, result.finalContent)
         }
+
+        val msg =
+            buildString {
+                append("Queued edits for review in ${args.path}. ")
+                append("Applied ${result.appliedCount}, skipped ${result.skippedCount} (already applied).")
+                if (result.unappliedCount > 0) {
+                    append("\nWarning: ${result.unappliedCount} edits could not be applied after multiple passes.")
+                }
+            }
+
+        return Result(
+            appliedCount = result.appliedCount,
+            skippedCount = result.skippedCount,
+            path = absolutePath,
+            message = msg,
+        )
     }
 }
