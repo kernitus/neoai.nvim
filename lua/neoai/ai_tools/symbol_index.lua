@@ -78,7 +78,6 @@ M.meta = {
   },
 }
 
--- Helpers (duplicated in a small form from treesitter_query for encapsulation)
 local function get_bufnr_for_path(file_path)
   if file_path and #file_path > 0 then
     local bufnr = vim.fn.bufnr(file_path, true)
@@ -954,10 +953,11 @@ local function gather_files(args)
   return files
 end
 
-M.run = function(args)
+-- Internal function that returns raw data (Table)
+M.scan = function(args)
   args = args or {}
 
-  -- Coerce languages filter: empty array means include all
+  -- Coerce languages filter
   local include_langs = {}
   if type(args.languages) == "table" and #args.languages > 0 then
     for _, l in ipairs(args.languages) do
@@ -967,15 +967,15 @@ M.run = function(args)
 
   local files, ferr = gather_files(args)
   if ferr then
-    return "SymbolIndex: " .. ferr
+    return nil, "SymbolIndex: " .. ferr
   end
   if not files or #files == 0 then
-    return "SymbolIndex: No files to process"
+    return {}, nil
   end
 
   local max_files = tonumber(args.max_files) or 150
   local results = {}
-  local fcount, scount = 0, 0
+  local fcount = 0
 
   for _, f in ipairs(files) do
     if fcount >= max_files then
@@ -990,20 +990,39 @@ M.run = function(args)
       if lang_ok then
         table.insert(results, res)
         fcount = fcount + 1
-        if type(res.symbols) == "table" then
-          scount = scount + #res.symbols
-        end
       end
+    end
+  end
+
+  return results, nil
+end
+
+-- Public tool entry point (returns formatted string/JSON for AI)
+M.run = function(args)
+  local results, err = M.scan(args)
+  if err then
+    return err
+  end
+
+  if #results == 0 then
+    return "SymbolIndex: No symbols found."
+  end
+
+  local fcount = #results
+  local scount = 0
+  for _, r in ipairs(results) do
+    if r.symbols then
+      scount = scount + #r.symbols
     end
   end
 
   local payload = { files = results, summary = { files = fcount, symbols = scount } }
   local okj, json = pcall(vim.fn.json_encode, payload)
+
   local content
   if okj then
     content = utils.make_code_block(json, "json")
   else
-    -- Fallback plain text
     local lines = { "SymbolIndex results:" }
     for _, rf in ipairs(results) do
       table.insert(lines, string.format("- %s (%s): %d symbols", rf.file, rf.language or "?", #(rf.symbols or {})))

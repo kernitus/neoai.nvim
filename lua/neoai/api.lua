@@ -288,6 +288,45 @@ function api.cancel()
   end
 end
 
+-- Global callback for internal tool execution requests from Kotlin
+function _G.NeoAI_OnInternalRequest(req)
+  -- req is { id=123, module="...", func="...", args={...} }
+  local id = req.id
+  local module_name = req.module
+  local func_name = req.func
+  local args = req.args
+
+  local ok, mod = pcall(require, module_name)
+  if not ok then
+    api.get_client():notify("callback", { id = id, error = "Lua module not found: " .. tostring(mod) })
+    return
+  end
+
+  local func = mod[func_name]
+  if type(func) ~= "function" then
+    api.get_client():notify("callback", { id = id, error = "Function not found: " .. func_name })
+    return
+  end
+
+  -- Execute the tool
+  local success, result = pcall(func, args)
+
+  if not success then
+    api.get_client():notify("callback", { id = id, error = "Tool execution failed: " .. tostring(result) })
+  else
+    -- If the tool returns a table (like SymbolIndex), we might need to serialize it or pick a field.
+    -- Assuming your tools return a table { content = "..." } or just a string.
+    local payload = result
+    if type(result) == "table" and result.content then
+      payload = result.content
+    elseif type(result) == "table" then
+      payload = vim.json.encode(result)
+    end
+
+    api.get_client():notify("callback", { id = id, result = payload })
+  end
+end
+
 -- -- Global callback invoked by the daemon
 -- The daemon sends: nvim_exec_lua("NeoAI_OnChunk(...)", [{ type="...", data=... }])
 function _G.NeoAI_OnChunk(chunk)

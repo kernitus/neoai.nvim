@@ -40,7 +40,10 @@ class GrepTool(
     override val description: String =
         """
         # WHEN TO USE THIS TOOL
-        - Use Grep for raw text searches across multiple files.
+        - Use Grep for raw text searches (e.g. finding "TODO" comments, specific string literals, or text from runtime logs).
+        - DO NOT use this to find code definitions (classes/functions). Use 'find_symbol' for that.
+        - DO NOT use this to check for compilation errors. Use 'lsp_diagnostic' for that.
+        
         # FEATURES
         - Fast, recursive search using `ripgrep` (rg).
         - Respects .gitignore.
