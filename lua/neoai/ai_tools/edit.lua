@@ -185,7 +185,7 @@ M.meta = {
   name = "Edit",
   description = utils.read_description("edit")
     .. " Edits may be provided in any order; the engine applies them order-invariantly and resolves overlaps."
-    .. " Caller must buffer the full tool-call arguments before invoking this tool (no partial streaming).",
+    .. " Caller must buffer the full tool-call arguments before invoking this tool (no partial streaming) and must include every change for the target file within a single call.",
   parameters = {
     type = "object",
     properties = {

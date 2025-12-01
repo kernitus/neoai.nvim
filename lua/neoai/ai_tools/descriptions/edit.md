@@ -9,10 +9,10 @@
 
 # HOW TO USE
 
-- Provide `file_path` and an array of `edits`.
+- Provide `file_path` and an array of `edits`. All edits for the same file must be grouped into this single call; do not issue multiple `Edit` tool calls for one file in the same turn.
 - Plain text only (no base64).
 - Each edit has:
-  - `old_string`: The text to replace. Matching is robust to case and minor whitespace differences and uses multiple strategies (exact, trimmed, anchors, shrinking window, cross-line whitespace-collapsed substring, Tree-sitter when available, and normalised text). Provide a distinctive, contiguous block from the file. The order of edits is not important.
+  - `old_string`: The text to replace. Matching is robust to case and minor whitespace differences and uses multiple strategies (exact, trimmed, anchors, shrinking window, cross-line whitespace-collapsed substring, Tree-sitter when available, and normalised text). Provide a distinctive, contiguous block from the file.
   - `new_string`: The replacement text. If `old_string` cannot be found but `new_string` is already present, the edit is treated as already applied and is skipped (idempotent behaviour).
 - Insertion: set `old_string` to an empty string to insert new content without an explicit anchor. By default, the first such insertion goes to the top of the file; subsequent insertions (in the same run) append to the end.
 

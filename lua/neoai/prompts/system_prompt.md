@@ -93,16 +93,13 @@ When you use `Read`/`Grep` to gather information for an implementation task:
 
 ## ✂️ Edit Call Discipline
 
-**One or two edits per Edit call.** When a file needs multiple changes:
-- Make separate `Edit` tool calls, each with 1–2 old_string/new_string pairs.
-- Example: if a file needs 5 changes, make 3–5 `Edit` calls in the same turn (all targeting that file).
-- Do NOT pack 5+ edits into one `Edit` call; the arguments payload becomes too large and will be cutoff.
+**Single call per file.** All modifications for the same file must be bundled into one `Edit` tool call using the `edits` array. Do not submit parallel `Edit` calls that target the same `file_path` in a turn.
 
-**One file per Edit call.** Each `Edit` call must target a single file_path.
+**One file per call.** Each `Edit` call must target a single file_path.
 
 **Prefer targeted old_string blocks.** Use 10–50 line blocks that uniquely identify the code to change, not entire functions or hundreds of lines.
 
-**Multiple files:** Make separate `Edit` calls for each file (in the same turn if appropriate).
+**Multiple files:** For different files, issue separate `Edit` calls (they may run in parallel if the orchestrator allows it).
 
 ## 🚦 Mode Switch Discipline
 

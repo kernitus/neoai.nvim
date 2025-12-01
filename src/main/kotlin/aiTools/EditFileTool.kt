@@ -17,15 +17,28 @@ class CustomEditFileTool<Path>(
     private val fs: FileSystemProvider.ReadWrite<Path>,
     private val workingDirectory: String,
 ) : Tool<CustomEditFileTool.Args, CustomEditFileTool.Result>() {
+    companion object {
+        private const val DUPLICATE_PATH_ERROR_PREFIX = "Edit tool error: multiple tool calls attempted for the same file"
+    }
+
+    private val currentTurnCallPaths: MutableSet<String> = java.util.Collections.synchronizedSet(mutableSetOf())
+
+    fun resetTurnState() {
+        currentTurnCallPaths.clear()
+    }
     @Serializable
     data class Args(
         @property:LLMDescription("Relative path to the file. If it doesn't exist, it will be created.")
         val path: String,
         @property:LLMDescription(
-            "List of edit operations to apply to this file. The engine applies them order-invariantly and resolves overlaps.",
+            "List of edit operations to apply to this file. All edits for a file must be supplied in this single call; the engine applies them order-invariantly and resolves overlaps.",
         )
         val edits: List<EditOperation>,
-    )
+    ) {
+        init {
+            validate(edits.isNotEmpty()) { "Edits array must contain at least one operation." }
+        }
+    }
 
     @Serializable
     data class EditOperation(
