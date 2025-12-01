@@ -4,11 +4,6 @@ import ai.koog.agents.core.tools.Tool
 import ai.koog.agents.core.tools.annotations.LLMDescription
 import ai.koog.agents.core.tools.validate
 import com.github.kernitus.neoai.DebugLogger
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import java.io.File
@@ -24,10 +19,12 @@ class GrepTool(
         @property:LLMDescription("When true, treat query_string as a ripgrep regex. When false, use literal/fixed-string search.")
         val useRegex: Boolean = false,
         @property:LLMDescription(
-            "Restrict search to files of this type (e.g., 'lua', 'ts'). Use 'all' to search all known file types. Use empty string for no restriction. See `rg --type-list` for options.",
+            "Restrict search to files of this type (e.g. 'kotlin', 'python', 'javascript'). Use empty string for no restriction.",
         )
         val fileType: String = "",
-        @property:LLMDescription("Exclude files of this type from the search (e.g., 'md', 'json'). Use empty string for no exclusion.")
+        @property:LLMDescription(
+            "Exclude files of this type from the search. Use empty string for no exclusion.",
+        )
         val excludeFileType: String = "",
     )
 
@@ -50,21 +47,25 @@ class GrepTool(
         """.trimIndent()
 
     override suspend fun execute(args: Args): Result {
+        // 1. Normalise the file types before logging or executing
+        val finalFileType = normaliseFileType(args.fileType)
+        val finalExcludeType = normaliseFileType(args.excludeFileType)
+
         DebugLogger.log(
             "GrepTool.execute: START query=${args.queryString} " +
-                "useRegex=${args.useRegex} fileType=${args.fileType} excludeFileType=${args.excludeFileType}",
+                "useRegex=${args.useRegex} fileType=$finalFileType (raw: ${args.fileType}) excludeFileType=$finalExcludeType",
         )
         try {
             validate(args.queryString.isNotBlank()) { "Error: 'queryString' is required." }
 
-            val paramsLine = makeParamsLine(args.queryString, args.useRegex, args.fileType, args.excludeFileType)
+            val paramsLine = makeParamsLine(args.queryString, args.useRegex, finalFileType, finalExcludeType)
 
             val initialResult =
                 runRipgrep(
                     query = args.queryString,
                     useRegex = args.useRegex,
-                    fileType = args.fileType,
-                    excludeFileType = args.excludeFileType,
+                    fileType = finalFileType,
+                    excludeFileType = finalExcludeType,
                 )
 
             // Regex failure check
@@ -79,8 +80,8 @@ class GrepTool(
                     runRipgrep(
                         query = args.queryString,
                         useRegex = false,
-                        fileType = args.fileType,
-                        excludeFileType = args.excludeFileType,
+                        fileType = finalFileType,
+                        excludeFileType = finalExcludeType,
                     )
                 if (fallbackResult.stdout.isNotBlank()) {
                     return Result(formatOutput(fallbackResult.stdout), paramsLine + " (Fallback: Literal)")
@@ -88,6 +89,7 @@ class GrepTool(
             }
 
             if (initialResult.exitCode > 1) {
+                // If rg fails due to a type error despite normalisation, we return the error so the AI knows.
                 return Result("Error running rg: ${initialResult.stderr}", paramsLine)
             }
 
@@ -104,6 +106,54 @@ class GrepTool(
                 output = "TOOL CRASHED: ${t.message}\n${t.stackTraceToString()}",
                 paramsLine = "Error executing grep",
             )
+        }
+    }
+
+    /**
+     * Maps common AI guesses (extensions or full names) to the specific type alias required by ripgrep.
+     * This is because ripgrep doesn't have consistent naming, e.g. uses "markdown" but then "js".
+     */
+    private fun normaliseFileType(input: String): String {
+        if (input.isBlank()) return ""
+        val lower = input.lowercase().trim()
+
+        // Remove leading dot if the AI provided an extension like ".kt"
+        val clean = if (lower.startsWith(".")) lower.substring(1) else lower
+
+        return when (clean) {
+            // Map Extensions -> Ripgrep Type Name
+            "kt" -> "kotlin"
+
+            "py" -> "python"
+
+            "rs" -> "rust"
+
+            "md" -> "markdown"
+
+            "rb" -> "ruby"
+
+            "sh" -> "sh"
+
+            // rg uses 'sh' for bash/zsh/etc
+            "yml" -> "yaml"
+
+            "tsx" -> "ts"
+
+            "jsx" -> "js"
+
+            // Map Full Names -> Ripgrep Short Codes
+            "javascript" -> "js"
+
+            "typescript" -> "ts"
+
+            "golang" -> "go"
+
+            "bash" -> "sh"
+
+            "shell" -> "sh"
+
+            // Pass through everything else (java, lua, json, go, etc. match correctly)
+            else -> clean
         }
     }
 
@@ -148,8 +198,6 @@ class GrepTool(
 
         val process = processBuilder.start()
 
-        DebugLogger.log("GrepTool.runRipgrep: process started, reading stdout...")
-
         // Same pattern as list_directory, but bounded
         val stdout = readStreamWithLimit(process.inputStream, 100 * 1024)
 
@@ -159,11 +207,6 @@ class GrepTool(
         if (exitCode > 1) {
             stderr = process.errorStream.bufferedReader().use { it.readText() }
         }
-
-        DebugLogger.log(
-            "GrepTool.runRipgrep: done exitCode=$exitCode " +
-                "stdoutLen=${stdout.length} stderrLen=${stderr.length}",
-        )
 
         return ProcessResult(stdout, stderr, exitCode)
     }
