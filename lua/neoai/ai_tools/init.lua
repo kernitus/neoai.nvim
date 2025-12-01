@@ -5,8 +5,6 @@ M.tool_schemas = {}
 
 -- List of tool modules to load
 local tool_names = {
-  "read",
-  "treesitter_query",
   "symbol_index",
   "edit",
   "present",

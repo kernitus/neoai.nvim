@@ -5,6 +5,7 @@ import ai.koog.agents.core.tools.annotations.LLMDescription
 import com.github.kernitus.neoai.NeovimBridge
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.serializer
 
 class FindSymbolTool : Tool<FindSymbolTool.Args, FindSymbolTool.Result>() {
     @Serializable
@@ -21,7 +22,8 @@ class FindSymbolTool : Tool<FindSymbolTool.Args, FindSymbolTool.Result>() {
     @Suppress("EnumEntryName")
     enum class SearchType {
         definition,
-        // TODO add 'references' and 'implementations'
+        implementation,
+        references,
     }
 
     @Serializable
@@ -33,13 +35,16 @@ class FindSymbolTool : Tool<FindSymbolTool.Args, FindSymbolTool.Result>() {
     override val description =
         """
         # WHEN TO USE
-        - Use this to locate where a class, function, or variable is DEFINED.
+        - Use this to locate where a class, function, or variable is DEFINED, IMPLEMENTED, or REFERENCED.
+        - Set `type` to 'definition' (default), 'implementation', or 'references'.
         - PREFER THIS over 'grep'.
-        - It uses a combination of LSP, Tree-sitter, and heuristic text search to find definitions.
+        - It uses a combination of LSP, Tree-sitter, and heuristic text search to find definitions, and falls back to LSP lookups for implementations/references.
         """.trimIndent()
 
-    override val argsSerializer = Args.serializer()
-    override val resultSerializer = Result.serializer()
+    override val argsSerializer: KSerializer<Args>
+        get() = serializer()
+    override val resultSerializer: KSerializer<Result>
+        get() = serializer()
 
     override suspend fun execute(args: Args): Result {
         val lang =
