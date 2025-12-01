@@ -8,8 +8,8 @@ NeoAI.nvim is inspired by Avante.nvim but focuses relentlessly on doing one thin
 
 ## Features
 
-- **Project-Scoped Session**: Exactly one chat session per workspace (git project or cwd) keeps state simple and ephemeral
-- **Persistent Storage**: Chat history is stored via the Kotlin JSONL backend per workspace
+- **Multi-Session Support**: Create, switch, rename, and delete multiple chat sessions
+- **Persistent Storage**: Chat history is saved using JSON file storage
 - **Interactive Chat UI**: Split-window chat interface with Markdown rendering and model name display
 - **Session Management**: Telescope-powered session picker for easy navigation
 - **Streaming Responses**: Real-time assistant replies with thinking time indicator and response duration
@@ -169,9 +169,20 @@ If you launch Neovim via a plugin manager (lazy.nvim, packer, etc.), add a post-
 
 You can ask your plugin manager to run `./gradlew shadowJar` from the plugin’s directory every time it initialises, ensuring the Kotlin sidecar is always current. See the lazy.nvim specification above for a single example that combines dependencies, build hooks, Kotlin automation, and model configuration.
 
-## Workspace-Scoped Storage
+## Persistent Storage Options
 
-NeoAI now stores chat history per workspace (git root or current working directory) using the Kotlin JSONL backend. Set `chat.database_path` to any directory; the daemon will create one `.jsonl` file per workspace automatically. There is no sessions list or picker—each workspace keeps a single rolling history. To reset history, delete the corresponding `.jsonl` file or change the workspace path.
+NeoAI supports persistent storage for chat sessions and message history:
+
+- JSON file: If you set `database_path` to a `.json` file (e.g. `neoai.json`), NeoAI will use a plain JSON file for storage (no dependencies required).
+
+Example:
+
+```lua
+chat = {
+  -- Use JSON file storage (no dependencies)
+  -- database_path = vim.fn.stdpath("data") .. "/neoai.json",
+}
+```
 
 ## Commands
 
@@ -183,8 +194,11 @@ NeoAI now stores chat history per workspace (git root or current working directo
 
 ### Session Management Commands
 
-The workspace-scoped storage model keeps a single session per project, so most session commands are no-ops. The only relevant command is:
-
+- `:NeoAISessionList` - Interactive session picker (Telescope-powered)
+- `:NeoAINewSession [title]` - Create new chat session
+- `:NeoAISwitchSession <id>` - Switch to specific session by ID
+- `:NeoAIDeleteSession <id>` - Delete session by ID
+- `:NeoAIRenameSession <title>` - Rename current session
 - `:NeoAIStats` - Show database statistics and session info
 
 ## Keymaps
@@ -194,6 +208,8 @@ In Normal Mode (global):
 - `<leader>ai` - Open Chat
 - `<leader>at` - Toggle Chat
 - `<leader>ac` - Clear Chat Session
+- `<leader>as` - Session List (Telescope picker)
+- `<leader>an` - New Session
 - `<leader>aS` - Show Statistics
 
 In Chat Input Buffer:

@@ -629,7 +629,8 @@ function chat.setup()
   end
   chat.chat_state.current_session = active
 
-  chat.chat_state.sessions = {}
+  local ok_all, sessions = pcall(storage.get_all_sessions)
+  chat.chat_state.sessions = ok_all and sessions or {}
 
   _setup_done = true
   return true
@@ -669,6 +670,12 @@ local function update_chat_display()
   table.insert(lines, " *Session: " .. (sess.title or "Untitled") .. "* ")
   table.insert(lines, " *ID: " .. sess.id .. " | Messages: " .. #messages .. "* ")
   table.insert(lines, " *Created: " .. sess.created_at .. "* ")
+  if #chat.chat_state.sessions > 1 then
+    table.insert(
+      lines,
+      " *Total Sessions: " .. #chat.chat_state.sessions .. " | Use :NeoAISessionList or `<leader>as` to switch* "
+    )
+  end
   table.insert(lines, "")
 
   for _, message in ipairs(messages) do
@@ -749,16 +756,23 @@ end
 -- New session (non-fatal)
 function chat.new_session(title)
   title = title or ("Session " .. os.date("%Y-%m-%d %H:%M:%S"))
-  local ok_create, session_info = pcall(storage.create_session, title, {})
-  if not ok_create or not session_info then
-    vim.notify("NeoAI: Failed to initialise workspace session", vim.log.levels.ERROR)
+  local ok_create, session_id = pcall(storage.create_session, title, {})
+  if not ok_create or not session_id then
+    vim.notify("NeoAI: Failed to create new session", vim.log.levels.ERROR)
     return false
   end
 
-  chat.chat_state.current_session = session_info
+  local active = storage.get_active_session()
+  if not active then
+    vim.notify("NeoAI: Failed to load active session after creation", vim.log.levels.ERROR)
+    return false
+  end
 
-  chat.add_message(MESSAGE_TYPES.SYSTEM, "NeoAI Chat Session Started", { session_id = session_info.id })
-  vim.notify("Initialised session: " .. title, vim.log.levels.INFO)
+  chat.chat_state.current_session = active
+  chat.chat_state.sessions = storage.get_all_sessions()
+
+  chat.add_message(MESSAGE_TYPES.SYSTEM, "NeoAI Chat Session Started", { session_id = session_id })
+  vim.notify("Created new session: " .. title, vim.log.levels.INFO)
   return true
 end
 
@@ -1743,34 +1757,69 @@ function chat.get_session_info()
   }
 end
 
-function chat.switch_session()
-  return true
+function chat.switch_session(session_id)
+  local success = storage.switch_session(session_id)
+  if success then
+    chat.chat_state.current_session = storage.get_active_session()
+    chat.chat_state.sessions = storage.get_all_sessions()
+    if chat.chat_state.is_open then
+      update_chat_display()
+    end
+  end
+  return success
 end
 
 function chat.get_all_sessions()
-  return { chat.chat_state.current_session }
+  return storage.get_all_sessions()
 end
 
-function chat.delete_session()
-  vim.notify("Session deletion is disabled (single-session storage)", vim.log.levels.WARN)
-  return false
+function chat.delete_session(session_id)
+  local sessions = storage.get_all_sessions()
+  if #sessions <= 1 then
+    vim.notify("Cannot delete the only session", vim.log.levels.WARN)
+    return false
+  end
+  local is_current = chat.chat_state.current_session.id == session_id
+  local success = storage.delete_session(session_id)
+  if success then
+    if is_current then
+      local rem = storage.get_all_sessions()
+      if #rem > 0 then
+        chat.switch_session(rem[1].id)
+      else
+        chat.new_session()
+      end
+    end
+    chat.chat_state.sessions = storage.get_all_sessions()
+    if chat.chat_state.is_open then
+      update_chat_display()
+    end
+  end
+  return success
 end
 
 function chat.rename_session(new_title)
-  if not new_title or new_title == "" then
-    return false
+  local success = storage.update_session_title(chat.chat_state.current_session.id, new_title)
+  if success then
+    chat.chat_state.current_session.title = new_title
+    chat.chat_state.sessions = storage.get_all_sessions()
+    if chat.chat_state.is_open then
+      update_chat_display()
+    end
+    vim.notify("Session renamed to: " .. new_title, vim.log.levels.INFO)
   end
-  chat.chat_state.current_session.title = new_title
-  if chat.chat_state.is_open then
-    update_chat_display()
-  end
-  vim.notify("Session title updated", vim.log.levels.INFO)
-  return true
+  return success
 end
 
 function chat.clear_session()
-  vim.notify("Clearing the single session is not supported; delete the file manually if needed", vim.log.levels.WARN)
-  return false
+  local success = storage.clear_session_messages(chat.chat_state.current_session.id)
+  if success then
+    chat.add_message(MESSAGE_TYPES.SYSTEM, "NeoAI Chat Session Started", {})
+    if chat.chat_state.is_open then
+      update_chat_display()
+    end
+  end
+  return success
 end
 
 --- Open chat (if not open) and clear the current session so the user sees a fresh chat
