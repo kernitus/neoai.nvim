@@ -1467,17 +1467,28 @@ function chat.stream_ai_response(messages)
         end
 
         local fn_name = (call["function"] and call["function"].name) or call.name or "tool"
-
         local args = (call["function"] and call["function"].arguments) or call.arguments or ""
 
-        -- Extract a 'path' field from JSON arguments for display (if present)
-        local display_path = nil
+        -- [MODIFIED START] Extract a display string from JSON arguments
+        local display_info = nil
         if args ~= "" then
           local ok, decoded = pcall(vim.json.decode, args)
-          if ok and type(decoded) == "table" and type(decoded.path) == "string" then
-            display_path = decoded.path
+          if ok and type(decoded) == "table" then
+            -- Check for common fields in priority order
+            display_info = decoded.path
+              or decoded.file_path
+              or decoded.filePath
+              or decoded.queryString
+              or decoded.query
+              or decoded.name
+
+            -- If it's a search query, wrap it in quotes for clarity
+            if display_info and (decoded.queryString or decoded.query or decoded.name) then
+              display_info = '"' .. tostring(display_info) .. '"'
+            end
           end
         end
+        -- [MODIFIED END]
 
         if not tool_calls_by_id[id] then
           tool_calls_by_id[id] = {
@@ -1487,7 +1498,7 @@ function chat.stream_ai_response(messages)
             ["function"] = { name = fn_name, arguments = args },
             name = fn_name,
             arguments = args,
-            path = display_path,
+            path = display_info, -- We reuse the 'path' field to store the display info
             total_bytes = 0,
             done = false,
           }
@@ -1496,7 +1507,10 @@ function chat.stream_ai_response(messages)
           local existing = tool_calls_by_id[id]
           existing.name = fn_name or existing.name
           existing.arguments = args or existing.arguments
-          existing.path = display_path or existing.path
+          -- Update the display info if we parsed it successfully
+          if display_info then
+            existing.path = display_info
+          end
           if existing["function"] then
             existing["function"].name = fn_name or existing["function"].name
             existing["function"].arguments = args or existing["function"].arguments
@@ -1504,7 +1518,7 @@ function chat.stream_ai_response(messages)
         end
       end
 
-      -- Update overlay only (no "Tool calls:" text injected into the chat body)
+      -- Update overlay only
       update_tool_status_overlay()
     elseif ctype == "tool_done" then
       local pid = type(cdata) == "table" and cdata.id or cdata
