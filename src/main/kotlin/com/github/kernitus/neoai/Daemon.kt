@@ -38,9 +38,8 @@ import ai.koog.rag.base.files.JVMFileSystemProvider
 import com.github.kernitus.neoai.aiTools.CustomEditFileTool
 import com.github.kernitus.neoai.aiTools.CustomListDirectoryTool
 import com.github.kernitus.neoai.aiTools.CustomReadFileTool
-import com.github.kernitus.neoai.aiTools.FindSymbolTool
-import com.github.kernitus.neoai.aiTools.GrepTool
 import com.github.kernitus.neoai.aiTools.LspDiagnosticTool
+import com.github.kernitus.neoai.aiTools.SearchTool
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.DefaultRequest
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
@@ -665,12 +664,11 @@ suspend fun generate(
 
     val readFileTool = CustomReadFileTool(JVMFileSystemProvider.ReadOnly, cwd)
     val listDirTool = CustomListDirectoryTool<java.nio.file.Path>(cwd)
-    val findSymbolTool = FindSymbolTool()
+    val searchTool = SearchTool(cwd)
     val lspDiagnosticTool = LspDiagnosticTool()
-    val grepTool = GrepTool(cwd)
     val editFileTool = CustomEditFileTool(JVMFileSystemProvider.ReadWrite, cwd)
 
-    val myTools = listOf(readFileTool, listDirTool, findSymbolTool, lspDiagnosticTool, grepTool, editFileTool)
+    val myTools = listOf(readFileTool, listDirTool, searchTool, lspDiagnosticTool, editFileTool)
     val toolRegistry =
         ToolRegistry {
             myTools.forEach { tool(it) }
