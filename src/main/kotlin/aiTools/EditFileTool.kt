@@ -107,50 +107,68 @@ class CustomEditFileTool<Path>(
             fs.writeText(path, result.finalContent)
         }
 
-        val diagnosticsResult = runDiagnosticsInline(args.path)
+                val diagnosticsResult = runDiagnosticsInline(args.path)
 
-        val msg =
-            buildString {
-                append("Queued edits for review in ${args.path}. ")
-                append("Applied ${result.appliedCount}, skipped ${result.skippedCount} (already applied).")
-                if (result.unappliedCount > 0) {
-                    append("\nWarning: ${result.unappliedCount} edits could not be applied after multiple passes.")
-                }
-                if (diagnosticsResult.diagnostics.isNullOrBlank()) {
-                    append("\nNo diagnostics were returned.")
-                } else {
-                    append("\nDiagnostics summary: ${diagnosticsResult.diagnostics}")
+                val msg =
+                    buildString {
+                        append("Queued edits for review in ${args.path}. ")
+                        append("Applied ${result.appliedCount}, skipped ${result.skippedCount} (already applied).")
+                        if (result.unappliedCount > 0) {
+                            append("\nWarning: ${result.unappliedCount} edits could not be applied after multiple passes.")
+                        }
+                        if (diagnosticsResult.diagnostics.isNullOrBlank()) {
+                            append("\nNo diagnostics were returned.")
+                        } else {
+                            append("\nDiagnostics summary: ${diagnosticsResult.diagnostics}")
+                        }
+                    }
+
+                return Result(
+                    appliedCount = result.appliedCount,
+                    skippedCount = result.skippedCount,
+                    path = absolutePath,
+                    message = msg,
+                    diagnostics = diagnosticsResult.diagnostics,
+                    diagnosticCount = diagnosticsResult.count,
+                )
+            }
+
+            private suspend fun runDiagnosticsInline(relativePath: String): DiagnosticsPayload {
+                val diagnosticsCount = awaitDiagnosticsCount(relativePath)
+                val diagnosticsText = fetchDiagnosticsReport(relativePath)
+                return DiagnosticsPayload(diagnosticsText, diagnosticsCount)
+            }
+
+            private suspend fun awaitDiagnosticsCount(relativePath: String): Int {
+                val payload =
+                    mapOf(
+                        "file_path" to relativePath,
+                        "timeout_ms" to 1500,
+                    )
+                return try {
+                    when (val response = NeovimBridge.callLua("neoai.ai_tools.lsp_diagnostic", "await_count", payload)) {
+                        is Number -> response.toInt()
+                        is String -> response.toIntOrNull() ?: 0
+                        else -> 0
+                    }
+                } catch (_: Exception) {
+                    0
                 }
             }
 
-        return Result(
-            appliedCount = result.appliedCount,
-            skippedCount = result.skippedCount,
-            path = absolutePath,
-            message = msg,
-            diagnostics = diagnosticsResult.diagnostics,
-            diagnosticCount = diagnosticsResult.count,
-        )
-    }
-
-    private suspend fun runDiagnosticsInline(relativePath: String): DiagnosticsPayload {
-        val payload =
-            mapOf(
-                "file_path" to relativePath,
-                "include_code_actions" to false,
-            )
-        val response = NeovimBridge.callLua("neoai.ai_tools.lsp_diagnostic", "run", payload)
-        val output = response?.toString()?.trim()
-        val count = parseDiagnosticCount(output)
-        return DiagnosticsPayload(output, count)
-    }
-
-    private fun parseDiagnosticCount(output: String?): Int {
-        if (output.isNullOrBlank()) return 0
-        val lines = output.lines().filter { it.isNotBlank() }
-        if (lines.size == 1 && lines.first().contains("No diagnostics", ignoreCase = true)) {
-            return 0
+            private suspend fun fetchDiagnosticsReport(relativePath: String): String? {
+                val payload =
+                    mapOf(
+                        "file_path" to relativePath,
+                        "include_code_actions" to false,
+                    )
+                return try {
+                    NeovimBridge.callLua("neoai.ai_tools.lsp_diagnostic", "run", payload)
+                        ?.toString()
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                } catch (_: Exception) {
+                    null
+                }
+            }
         }
-        return lines.size
-    }
-}
