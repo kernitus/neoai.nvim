@@ -251,7 +251,6 @@ class SearchTool(
         fileType: String,
         excludeFileType: String,
     ): ProcessResult {
-        // Note: "color" spelling is required for the ripgrep flag
         val command = mutableListOf("rg", "--vimgrep", "--color", "never")
 
         if (!useRegex) {
@@ -266,12 +265,9 @@ class SearchTool(
             command.add(excludeFileType)
         }
 
-        // Cap matches to prevent context flooding
         command.add("--max-count=200")
         command.add("-e")
         command.add(query)
-
-        // Search current working directory
         command.add(".")
 
         DebugLogger.log("SearchTool: launching ${command.joinToString(" ")} in $workingDirectory")
@@ -281,20 +277,16 @@ class SearchTool(
 
         val process = processBuilder.start()
 
-        // Close stdin immediately. We are not writing to the process.
-        // This frees one file descriptor immediately.
+        // Close stdin immediately. We do not write to the process, so keeping this open leaks a descriptor.
         process.outputStream.close()
 
+        // Read stdout. The helper function uses .use {}, so this stream is closed automatically.
         val stdout = readStreamWithLimit(process.inputStream, 100 * 1024)
-        val exitCode = process.waitFor()
 
-        var stderr = ""
-        if (exitCode > 1) {
-            stderr = process.errorStream.bufferedReader().use { it.readText() }
-        } else {
-            // Even if we didn't read it, we must close it to free the FD
-            process.errorStream.close()
-        }
+        // Read and close stderr immediately.
+        val stderr = process.errorStream.bufferedReader().use { it.readText() }
+
+        val exitCode = process.waitFor()
 
         return ProcessResult(stdout, stderr, exitCode)
     }
