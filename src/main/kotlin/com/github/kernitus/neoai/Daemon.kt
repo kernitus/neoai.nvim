@@ -14,6 +14,7 @@ import ai.koog.agents.core.tools.ToolRegistry
 import ai.koog.agents.features.eventHandler.feature.handleEvents
 import ai.koog.prompt.dsl.Prompt
 import ai.koog.prompt.dsl.prompt
+import ai.koog.prompt.executor.clients.ConnectionTimeoutConfig
 import ai.koog.prompt.executor.clients.openai.OpenAIChatParams
 import ai.koog.prompt.executor.clients.openai.OpenAIClientSettings
 import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
@@ -76,6 +77,7 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.time.Duration.Companion.minutes
 
 // Define the scope for background tasks
 // Dispatchers.IO is best for network requests; SupervisorJob prevents one crash from killing the whole scope
@@ -83,6 +85,9 @@ private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
 // Custom GPT‑5.1 model
 private val GPT5_1 = OpenAIModels.Chat.GPT5.copy(id = "gpt-5.1")
+
+// Reuse the same client
+private val sharedHttpClient = HttpClient()
 
 object DebugLogger {
     private val file = java.io.File("/tmp/neoai-debug.log")
@@ -673,14 +678,21 @@ suspend fun generate(
 
     val model = pickModel(modelName)
 
+    val hardcodedTimeout =
+        ConnectionTimeoutConfig(
+            requestTimeoutMillis = 900000L,
+            connectTimeoutMillis = 60_000L,
+            socketTimeoutMillis = 900000L,
+        )
+
     val clientSettings =
         if (url.isNotBlank()) {
-            OpenAIClientSettings(baseUrl = url)
+            OpenAIClientSettings(baseUrl = url, timeoutConfig = hardcodedTimeout)
         } else {
-            OpenAIClientSettings()
+            OpenAIClientSettings(timeoutConfig = hardcodedTimeout)
         }
 
-    val openAIClient = FixedOpenAILLMClient(apiKey = finalApiKey, settings = clientSettings)
+    val openAIClient = FixedOpenAILLMClient(apiKey = finalApiKey, settings = clientSettings, baseClient = sharedHttpClient)
     val executor = MultiLLMPromptExecutor(LLMProvider.OpenAI to openAIClient)
 
     val reasoningParams =

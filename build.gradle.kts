@@ -1,7 +1,7 @@
 import org.gradle.jvm.tasks.Jar
 
 plugins {
-    kotlin("jvm") version "2.3.0-Beta2"
+    kotlin("jvm") version "2.3.0-RC"
     kotlin("plugin.serialization") version "2.0.0"
     application
     id("com.gradleup.shadow") version "9.2.2"
@@ -27,7 +27,6 @@ dependencies {
     implementation("org.msgpack:msgpack-core:0.9.10")
     // Msgpack for Kotlin object serialisation
     implementation("com.ensarsarajcic.kotlinx:serialization-msgpack:0.6.0")
-
 }
 
 application {

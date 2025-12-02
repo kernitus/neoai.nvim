@@ -31,19 +31,28 @@ import kotlinx.serialization.json.JsonObject
 class FixedOpenAILLMClient(
     apiKey: String,
     private val settings: OpenAIClientSettings,
+    // --- ADDED PARAMETER HERE ---
+    private val baseClient: HttpClient? = null,
     private val responseJson: Json =
         Json {
             ignoreUnknownKeys = true
             encodeDefaults = false
         },
 ) : OpenAILLMClient(apiKey, settings) {
+    // Uses the shared baseClient if available to prevent resource leaks
     private val myHttpClient =
-        HttpClient {
+        baseClient?.config {
             install(ContentNegotiation)
             install(DefaultRequest) {
                 headers.append("Authorization", "Bearer $apiKey")
             }
         }
+            ?: HttpClient {
+                install(ContentNegotiation)
+                install(DefaultRequest) {
+                    headers.append("Authorization", "Bearer $apiKey")
+                }
+            }
 
     // Track mapping between ephemeral item_id and stable call_id
     private val itemIdToCallId = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -116,7 +125,9 @@ class FixedOpenAILLMClient(
                             )
                         }
 
-                        else -> null
+                        else -> {
+                            null
+                        }
                     }
                 }
 
@@ -322,4 +333,3 @@ class FixedOpenAILLMClient(
         val text: String? = null,
     )
 }
-

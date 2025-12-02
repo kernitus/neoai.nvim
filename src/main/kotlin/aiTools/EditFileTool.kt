@@ -7,6 +7,7 @@ import ai.koog.rag.base.files.FileMetadata
 import ai.koog.rag.base.files.FileSystemProvider
 import ai.koog.rag.base.files.readText
 import ai.koog.rag.base.files.writeText
+import com.github.kernitus.neoai.NeovimBridge
 import com.github.kernitus.neoai.aiTools.patch.FilePatch
 import com.github.kernitus.neoai.aiTools.patch.applyBatchPatches
 import kotlinx.serialization.KSerializer
@@ -23,9 +24,15 @@ class CustomEditFileTool<Path>(
 
     private val currentTurnCallPaths: MutableSet<String> = java.util.Collections.synchronizedSet(mutableSetOf())
 
+    private data class DiagnosticsPayload(
+        val diagnostics: String?,
+        val count: Int,
+    )
+
     fun resetTurnState() {
         currentTurnCallPaths.clear()
     }
+
     @Serializable
     data class Args(
         @property:LLMDescription("Relative path to the file. If it doesn't exist, it will be created.")
@@ -54,6 +61,8 @@ class CustomEditFileTool<Path>(
         val skippedCount: Int,
         val path: String,
         val message: String,
+        val diagnostics: String? = null,
+        val diagnosticCount: Int = 0,
     )
 
     override val argsSerializer: KSerializer<Args> = Args.serializer()
@@ -98,12 +107,19 @@ class CustomEditFileTool<Path>(
             fs.writeText(path, result.finalContent)
         }
 
+        val diagnosticsResult = runDiagnosticsInline(args.path)
+
         val msg =
             buildString {
                 append("Queued edits for review in ${args.path}. ")
                 append("Applied ${result.appliedCount}, skipped ${result.skippedCount} (already applied).")
                 if (result.unappliedCount > 0) {
                     append("\nWarning: ${result.unappliedCount} edits could not be applied after multiple passes.")
+                }
+                if (diagnosticsResult.diagnostics.isNullOrBlank()) {
+                    append("\nNo diagnostics were returned.")
+                } else {
+                    append("\nDiagnostics summary: ${diagnosticsResult.diagnostics}")
                 }
             }
 
@@ -112,6 +128,29 @@ class CustomEditFileTool<Path>(
             skippedCount = result.skippedCount,
             path = absolutePath,
             message = msg,
+            diagnostics = diagnosticsResult.diagnostics,
+            diagnosticCount = diagnosticsResult.count,
         )
+    }
+
+    private suspend fun runDiagnosticsInline(relativePath: String): DiagnosticsPayload {
+        val payload =
+            mapOf(
+                "file_path" to relativePath,
+                "include_code_actions" to false,
+            )
+        val response = NeovimBridge.callLua("neoai.ai_tools.lsp_diagnostic", "run", payload)
+        val output = response?.toString()?.trim()
+        val count = parseDiagnosticCount(output)
+        return DiagnosticsPayload(output, count)
+    }
+
+    private fun parseDiagnosticCount(output: String?): Int {
+        if (output.isNullOrBlank()) return 0
+        val lines = output.lines().filter { it.isNotBlank() }
+        if (lines.size == 1 && lines.first().contains("No diagnostics", ignoreCase = true)) {
+            return 0
+        }
+        return lines.size
     }
 }
