@@ -81,28 +81,44 @@ class CustomReadFileTool<Path>(
             "File is not a text file: $absolutePath"
         }
 
-        // Read the entire file
-        val fullText = fs.readText(path)
-        val lines = fullText.lines()
-        val totalLines = lines.size
-
         // Apply line range filtering
         val startIdx = args.startLine.coerceAtLeast(0)
-        val endIdx = if (args.endLine < 0) totalLines else args.endLine.coerceAtMost(totalLines)
+        // If endLine is -1, we read until the end (represented by Max Value)
+        val endIdx = if (args.endLine < 0) Int.MAX_VALUE else args.endLine
 
         validate(startIdx <= endIdx) {
             "Invalid line range: startLine=$startIdx > endLine=$endIdx"
         }
+
+        val contentBuilder = StringBuilder()
+        var totalLines = 0
+
+        // Stream the file to avoid loading the entire content into memory
+        File(absolutePath).bufferedReader().use { reader ->
+            var line = reader.readLine()
+            while (line != null) {
+                // Collect content only if within the requested range
+                if (totalLines >= startIdx && totalLines < endIdx) {
+                    if (contentBuilder.isNotEmpty()) {
+                        contentBuilder.append("\n")
+                    }
+                    contentBuilder.append(line)
+                }
+
+                // We must continue reading to count totalLines correctly,
+                // even if we have passed the endIdx.
+                totalLines++
+                line = reader.readLine()
+            }
+        }
+
         validate(startIdx < totalLines) {
             "startLine=$startIdx is beyond file end (file has $totalLines lines)"
         }
 
-        val selectedLines = lines.subList(startIdx, endIdx)
-        val content = selectedLines.joinToString("\n")
-
         return Result(
             path = absolutePath,
-            content = content,
+            content = contentBuilder.toString(),
             totalLines = totalLines,
         )
     }
