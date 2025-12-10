@@ -21,7 +21,6 @@ class SearchTool(
                 "- 'SMART': (Default) Tries to find the code DEFINITION first. If not found, falls back to text search.\n" +
                 "- 'REFERENCES': Find all usages/references of a symbol (LSP).\n" +
                 "- 'IMPLEMENTATIONS': Find implementations/overrides of an interface/class (LSP).\n" +
-                "- 'TEXT': Force a literal text search (Grep). Use for comments, logs, or TODOs.\n" +
                 "- 'REGEX': Force a regex search (Grep).",
         )
         val strategy: SearchStrategy = SearchStrategy.SMART,
@@ -36,7 +35,6 @@ class SearchTool(
         SMART,
         REFERENCES,
         IMPLEMENTATIONS,
-        TEXT,
         REGEX,
     }
 
@@ -52,13 +50,28 @@ class SearchTool(
     override val description: String =
         """
         # WHEN TO USE
-        - Use this for ALL search operations: finding code definitions, references, implementations, or raw text.
-        - Select the appropriate 'strategy' for your goal.
-        
+        - Use this tool for all project‑wide search operations: finding definitions, usages, or text.
+        - In almost all cases you should use **SMART**. Only choose a different strategy when it is clearly required.
         # STRATEGIES
-        - Use 'SMART' (default) when you want to find "where is X defined?" or general code lookup.
-        - Use 'REFERENCES' to see where a function or class is being used.
-        - Use 'TEXT' for comments, TODOs, or partial string matches.
+        - **SMART (preferred, default)**:
+          - Use for almost everything:
+            - "Where is X defined?"
+            - "Where is X used?"
+            - Discovering related files or state.
+            - Searching for comments, log messages, or other text.
+          - SMART will choose the best method (LSP definition where possible, otherwise plain text search). You do not need to decide this yourself.
+        - **REFERENCES**:
+          - Use only when you *specifically* want all usages/references of a known symbol via LSP.
+          - Example: "show me every place `handleSubmit` is called".
+        - **IMPLEMENTATIONS**:
+          - Use only when you *specifically* want implementations or overrides of an interface, abstract method, or class via LSP.
+        - **REGEX (advanced / rare)**:
+          - Use *only* when the user has explicitly requested a regular expression search, or when you genuinely need pattern‑based matching (for example many similar variants in one query).
+          - Do **not** use REGEX as a replacement for SMART or ordinary text search.
+          - If you are not confident that you are writing a correct regular expression, do not use this strategy.
+        # GENERAL GUIDANCE
+        - If you are unsure which strategy to choose, always pick **SMART**.
+        - Do **not** switch to REGEX just because SMART found no results; instead, reconsider the query or explain that nothing was found.
         """.trimIndent()
 
     override suspend fun execute(args: Args): Result {
@@ -77,7 +90,6 @@ class SearchTool(
             SearchStrategy.SMART -> executeSmartSearch(query, finalFileType, finalExcludeType)
             SearchStrategy.REFERENCES -> executeLspSearch(query, "references", finalFileType)
             SearchStrategy.IMPLEMENTATIONS -> executeLspSearch(query, "implementation", finalFileType)
-            SearchStrategy.TEXT -> executeGrep(query, isRegex = false, finalFileType, finalExcludeType)
             SearchStrategy.REGEX -> executeGrep(query, isRegex = true, finalFileType, finalExcludeType)
         }
     }
@@ -95,7 +107,7 @@ class SearchTool(
     ): Result {
         // Heuristic: If query contains spaces or non-code characters, it is likely text/comment.
         // We allow underscores and dots for fully qualified names.
-        val isLikelyText = query.contains(" ") || !query.all { it.isLetterOrDigit() || it == '_' || it == '.' }
+        val isLikelyText = " " in query || !query.all { it.isLetterOrDigit() || it == '_' || it == '.' }
 
         if (isLikelyText) {
             DebugLogger.log("SearchTool: Query looks like text. Skipping LSP.")
@@ -191,8 +203,6 @@ class SearchTool(
             return Result("TOOL CRASHED: ${t.message}", "Error")
         }
     }
-
-    // --- Helpers ---
 
     private fun isValidLspResult(output: String): Boolean =
         output.isNotBlank() &&

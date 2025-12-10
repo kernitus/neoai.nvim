@@ -721,7 +721,7 @@ suspend fun generate(
             toolRegistry = toolRegistry,
             agentConfig =
                 AIAgentConfig(
-                    maxAgentIterations = 300,
+                    maxAgentIterations = 500,
                     model = model,
                     prompt = promptObject,
                 ),
