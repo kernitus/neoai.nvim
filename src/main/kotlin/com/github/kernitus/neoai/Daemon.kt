@@ -272,6 +272,7 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
     strategy<List<Message.Request>, String>("streaming_loop") {
         val executeMultipleTools by nodeExecuteMultipleTools(parallelTools = true)
 
+        val reasoningItemsCache = mutableListOf<Message.Reasoning>()
         val nodeStreaming by node<List<Message.Request>, List<Message.Response>> { input ->
             llm.writeSession {
                 if (customParams != null) {
@@ -280,15 +281,34 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
 
                 val textBuffer = StringBuilder()
                 val toolCalls = mutableListOf<Message.Tool.Call>()
+                val reasoningItems = mutableListOf<Message.Reasoning>()
 
                 requestLLMStreaming().collect { frame ->
                     when (frame) {
                         is StreamFrame.Append -> {
-                            if (!frame.text.startsWith("|||REASONING|||") &&
-                                !frame.text.startsWith("|||TOOL_PROGRESS|||") &&
-                                !frame.text.startsWith("|||TOOL_DONE|||")
-                            ) {
-                                textBuffer.append(frame.text)
+                            when {
+                                frame.text.startsWith("|||REASONING_ITEM|||") -> {
+                                    // Parse: |||REASONING_ITEM|||id|encrypted|summary
+                                    val payload = frame.text.removePrefix("|||REASONING_ITEM|||")
+                                    val parts = payload.split("|", limit = 3)
+                                    if (parts.size >= 3) {
+                                        reasoningItems.add(
+                                            Message.Reasoning(
+                                                id = parts[0],
+                                                encrypted = parts[1],
+                                                content = parts[2],
+                                                metaInfo = ResponseMetaInfo.Empty,
+                                            ),
+                                        )
+                                    }
+                                }
+
+                                // TODO are we sure
+                                frame.text.startsWith("|||REASONING|||") -> {
+                                    // Still send summary to UI
+                                    val cleanText = frame.text.removePrefix("|||REASONING|||")
+                                    // This goes to UI only, not stored in responses
+                                }
                             }
                         }
 
@@ -308,6 +328,9 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
                 }
 
                 val responses = mutableListOf<Message.Response>()
+
+                responses.addAll(reasoningItemsCache)
+                reasoningItemsCache.clear()
 
                 if (textBuffer.isNotEmpty()) {
                     responses.add(
@@ -730,7 +753,10 @@ suspend fun generate(
                     onLLMStreamingFrameReceived { context ->
                         when (val frame = context.streamFrame) {
                             is StreamFrame.Append -> {
-                                if (frame.text.startsWith("|||REASONING|||")) {
+                                if (frame.text.startsWith("|||REASONING_ITEM|||")) {
+                                    // DON'T send to UI, store internally only
+                                    // This is handled in nodeStreaming
+                                } else if (frame.text.startsWith("|||REASONING|||")) {
                                     val cleanText = frame.text.removePrefix("|||REASONING|||")
                                     if (cleanText.isNotEmpty()) {
                                         sendChunk("reasoning_summary", cleanText, packer)

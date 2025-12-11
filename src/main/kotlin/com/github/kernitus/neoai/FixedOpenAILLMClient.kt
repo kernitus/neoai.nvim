@@ -5,6 +5,8 @@ import ai.koog.prompt.dsl.Prompt
 import ai.koog.prompt.executor.clients.openai.OpenAIClientSettings
 import ai.koog.prompt.executor.clients.openai.OpenAILLMClient
 import ai.koog.prompt.executor.clients.openai.OpenAIResponsesParams
+import ai.koog.prompt.executor.clients.openai.base.models.ReasoningEffort
+import ai.koog.prompt.executor.clients.openai.models.ReasoningSummary
 import ai.koog.prompt.llm.LLModel
 import ai.koog.prompt.message.Message
 import ai.koog.prompt.message.ResponseMetaInfo
@@ -31,7 +33,6 @@ import kotlinx.serialization.json.JsonObject
 class FixedOpenAILLMClient(
     apiKey: String,
     private val settings: OpenAIClientSettings,
-    // --- ADDED PARAMETER HERE ---
     private val baseClient: HttpClient? = null,
     private val responseJson: Json =
         Json {
@@ -125,8 +126,18 @@ class FixedOpenAILLMClient(
                             )
                         }
 
-                        else -> {
-                            null
+                        is Message.Reasoning -> {
+                            FixedItem(
+                                type = "reasoning",
+                                id = msg.id,
+                                encrypted = msg.encrypted,
+                                summary =
+                                    if (msg.content.isNotBlank()) {
+                                        listOf(FixedSummaryPart(type = "summary_text", text = msg.content))
+                                    } else {
+                                        null
+                                    },
+                            )
                         }
                     }
                 }
@@ -142,10 +153,15 @@ class FixedOpenAILLMClient(
                     reasoning =
                         params.reasoning?.let {
                             FixedReasoning(
-                                effort = it.effort?.name?.lowercase() ?: "medium",
-                                summary = "auto",
+                                effort =
+                                    it.effort?.name?.uppercase()?.let { effortName ->
+                                        ReasoningEffort.entries.find { enumValue -> enumValue.name == effortName }
+                                    } ?: ReasoningEffort.MEDIUM,
+                                summary = ReasoningSummary.AUTO,
                             )
                         },
+                    store = false,
+                    include = listOf("reasoning.encrypted_content"),
                 )
 
             val requestBody = responseJson.encodeToString(request)
@@ -225,15 +241,33 @@ class FixedOpenAILLMClient(
 
                                         "response.output_item.done" -> {
                                             val item = event.item
-                                            if (item != null && item.type == "function_call") {
-                                                DebugLogger.log("<<< TOOL CALL COMPLETE: ${item.name}")
-                                                emit(
-                                                    StreamFrame.ToolCall(
-                                                        id = item.callId ?: "",
-                                                        name = item.name ?: "",
-                                                        content = item.arguments ?: "",
-                                                    ),
-                                                )
+                                            if (item != null) {
+                                                when (item.type) {
+                                                    "reasoning" -> {
+                                                        DebugLogger.log("<<< REASONING ITEM RECEIVED (id=${item.id})")
+                                                        // Tunnel the encrypted reasoning through Append with a new prefix
+                                                        val encryptedContent = item.encrypted ?: ""
+                                                        val summary = item.summary?.joinToString("\n") { it.text ?: "" } ?: ""
+
+                                                        // Format: |||REASONING_ITEM|||id|encrypted|summary
+                                                        emit(
+                                                            StreamFrame.Append(
+                                                                "|||REASONING_ITEM|||${item.id}|$encryptedContent|$summary",
+                                                            ),
+                                                        )
+                                                    }
+
+                                                    "function_call" -> {
+                                                        DebugLogger.log("<<< TOOL CALL COMPLETE: ${item.name}")
+                                                        emit(
+                                                            StreamFrame.ToolCall(
+                                                                id = item.callId ?: "",
+                                                                name = item.name ?: "",
+                                                                content = item.arguments ?: "",
+                                                            ),
+                                                        )
+                                                    }
+                                                }
                                             }
                                         }
 
@@ -272,12 +306,14 @@ class FixedOpenAILLMClient(
         @SerialName("tool_choice") val toolChoice: String? = null,
         @SerialName("max_output_tokens") val maxOutputTokens: Int? = null,
         val reasoning: FixedReasoning? = null,
+        val store: Boolean = false,
+        val include: List<String>? = null,
     )
 
     @Serializable
     private data class FixedReasoning(
-        val effort: String,
-        val summary: String? = null,
+        val effort: ReasoningEffort,
+        val summary: ReasoningSummary? = null,
     )
 
     @Serializable
@@ -290,6 +326,8 @@ class FixedOpenAILLMClient(
         val output: String? = null,
         val name: String? = null,
         val arguments: String? = null,
+        @SerialName("encrypted_content") val encrypted: String? = null,
+        val summary: List<FixedSummaryPart>? = null,
     )
 
     @Serializable
