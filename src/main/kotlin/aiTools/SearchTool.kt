@@ -49,6 +49,9 @@ class SearchTool(
     override val name: String = "search_project"
     override val description: String =
         """
+        CRITICAL: Do NOT repeat a search query you have already tried.
+        If a search returned "No matches found", the code does not exist. Do not retry.
+
         # WHEN TO USE
         - Use this tool for all project‑wide search operations: finding definitions, usages, or text.
         - In almost all cases you should use **SMART**. Only choose a different strategy when it is clearly required.
