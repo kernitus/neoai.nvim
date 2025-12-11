@@ -756,6 +756,9 @@ suspend fun generate(
                                 if (frame.text.startsWith("|||REASONING_ITEM|||")) {
                                     // DON'T send to UI, store internally only
                                     // This is handled in nodeStreaming
+                                } else if (frame.text.startsWith("|||REASONING_FULL|||")) {
+                                    val cleanText = frame.text.removePrefix("|||REASONING_FULL|||")
+                                    sendChunk("reasoning_summary_full", cleanText, packer)
                                 } else if (frame.text.startsWith("|||REASONING|||")) {
                                     val cleanText = frame.text.removePrefix("|||REASONING|||")
                                     if (cleanText.isNotEmpty()) {

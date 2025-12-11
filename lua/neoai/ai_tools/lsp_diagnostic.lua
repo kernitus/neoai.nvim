@@ -32,24 +32,42 @@ M.meta = {
     additionalProperties = false,
   },
 }
---- Internal: resolve a buffer number from args
----@param args table
+--- Internal: resolve a buffer number from args without auto-creating new buffers
+---@param args table|nil
 ---@return integer|nil
 local function resolve_bufnr(args)
-  local bufnr
-  if args and type(args.bufnr) == "number" and args.bufnr > 0 then
-    bufnr = args.bufnr
-  elseif args and type(args.file_path) == "string" and #args.file_path > 0 then
-    bufnr = vim.fn.bufnr(args.file_path, true)
-  else
-    bufnr = vim.api.nvim_get_current_buf()
-    args = args or {}
-    args.file_path = vim.api.nvim_buf_get_name(bufnr)
+  args = args or {}
+  local function normalise_path(path)
+    if type(path) ~= "string" or path == "" then
+      return nil
+    end
+    return vim.fn.fnamemodify(path, ":p")
   end
-  if bufnr and bufnr > 0 then
-    pcall(vim.fn.bufload, bufnr)
+
+  if type(args.bufnr) == "number" and args.bufnr > 0 and vim.api.nvim_buf_is_valid(args.bufnr) then
+    return args.bufnr
   end
-  return bufnr
+
+  local normalised = normalise_path(args.file_path)
+  if normalised then
+    local existing = vim.fn.bufnr(normalised)
+    if existing > 0 and vim.api.nvim_buf_is_valid(existing) then
+      if not vim.api.nvim_buf_is_loaded(existing) then
+        pcall(vim.fn.bufload, existing)
+      end
+      args.file_path = vim.api.nvim_buf_get_name(existing)
+      return existing
+    end
+    return nil
+  end
+
+  local current = vim.api.nvim_get_current_buf()
+  if current and vim.api.nvim_buf_is_valid(current) then
+    args.file_path = vim.api.nvim_buf_get_name(current)
+    return current
+  end
+
+  return nil
 end
 
 --- Await an LSP DiagnosticChanged event (or timeout) then return current diagnostics count.

@@ -281,7 +281,7 @@ class FixedOpenAILLMClient(
                                                         ?.joinToString(separator = "") { it.text.orEmpty() }
 
                                                 if (!fullSummary.isNullOrBlank()) {
-                                                    emit(StreamFrame.Append("|||REASONING|||$fullSummary"))
+                                                    emit(StreamFrame.Append("|||REASONING_FULL|||$fullSummary"))
                                                 }
                                             }
                                             emit(StreamFrame.End(null, ResponseMetaInfo.Empty))

@@ -1386,10 +1386,19 @@ function chat.stream_ai_response(messages)
   api.stream(messages, function(chunk)
     -- DATA NORMALISATION
     local ctype = chunk.type or ""
-    local cdata = chunk.data or chunk.delta or ""
+    ---@type string|table|nil
+    local cdata = chunk.data
+    if cdata == nil then
+      cdata = chunk.delta
+    end
+    if cdata == nil then
+      cdata = ""
+    end
 
     if ctype == "response.reasoning_summary_text.delta" then
       ctype = "reasoning_summary"
+    elseif ctype == "response.reasoning_summary_text.result" then
+      ctype = "reasoning_summary_full"
     elseif ctype == "response.text.delta" then
       ctype = "content"
     elseif ctype == "tool_call" then
@@ -1425,8 +1434,11 @@ function chat.stream_ai_response(messages)
       append_stream_text(cdata)
     elseif ctype == "reasoning" and cdata ~= "" then
       reason = reason .. cdata
-    elseif ctype == "reasoning_summary" and cdata ~= "" then
+    elseif ctype == "reasoning_summary" and type(cdata) == "string" and cdata ~= "" then
       reasoning_summary = reasoning_summary .. cdata
+      update_reasoning_overlay()
+    elseif ctype == "reasoning_summary_full" then
+      reasoning_summary = (type(cdata) == "string" and cdata) or ""
       update_reasoning_overlay()
     elseif ctype == "tool_progress" then
       -- Handle the new progress event
