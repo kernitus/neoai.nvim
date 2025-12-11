@@ -24,10 +24,6 @@ class CustomEditFileTool<Path>(
 
     private val currentTurnCallPaths: MutableSet<String> = java.util.Collections.synchronizedSet(mutableSetOf())
 
-    private data class DiagnosticsPayload(
-        val diagnostics: String?,
-        val count: Int,
-    )
 
     fun resetTurnState() {
         currentTurnCallPaths.clear()
@@ -61,8 +57,6 @@ class CustomEditFileTool<Path>(
         val skippedCount: Int,
         val path: String,
         val message: String,
-        val diagnostics: String? = null,
-        val diagnosticCount: Int = 0,
     )
 
     override val argsSerializer: KSerializer<Args> = Args.serializer()
@@ -107,68 +101,21 @@ class CustomEditFileTool<Path>(
             fs.writeText(path, result.finalContent)
         }
 
-                val diagnosticsResult = runDiagnosticsInline(args.path)
+                        val msg =
+                            buildString {
+                                append("Queued edits for review in ${args.path}. ")
+                                append("Applied ${result.appliedCount}, skipped ${result.skippedCount} (already applied).")
+                                if (result.unappliedCount > 0) {
+                                    append("\nWarning: ${result.unappliedCount} edits could not be applied after multiple passes.")
+                                }
+                                append("\nRun the lsp_diagnostic tool on ${args.path} to inspect current issues.")
+                            }
 
-                val msg =
-                    buildString {
-                        append("Queued edits for review in ${args.path}. ")
-                        append("Applied ${result.appliedCount}, skipped ${result.skippedCount} (already applied).")
-                        if (result.unappliedCount > 0) {
-                            append("\nWarning: ${result.unappliedCount} edits could not be applied after multiple passes.")
-                        }
-                        if (diagnosticsResult.diagnostics.isNullOrBlank()) {
-                            append("\nNo diagnostics were returned.")
-                        } else {
-                            append("\nDiagnostics summary: ${diagnosticsResult.diagnostics}")
-                        }
+                        return Result(
+                            appliedCount = result.appliedCount,
+                            skippedCount = result.skippedCount,
+                            path = absolutePath,
+                            message = msg,
+                        )
                     }
-
-                return Result(
-                    appliedCount = result.appliedCount,
-                    skippedCount = result.skippedCount,
-                    path = absolutePath,
-                    message = msg,
-                    diagnostics = diagnosticsResult.diagnostics,
-                    diagnosticCount = diagnosticsResult.count,
-                )
-            }
-
-            private suspend fun runDiagnosticsInline(relativePath: String): DiagnosticsPayload {
-                val diagnosticsCount = awaitDiagnosticsCount(relativePath)
-                val diagnosticsText = fetchDiagnosticsReport(relativePath)
-                return DiagnosticsPayload(diagnosticsText, diagnosticsCount)
-            }
-
-            private suspend fun awaitDiagnosticsCount(relativePath: String): Int {
-                val payload =
-                    mapOf(
-                        "file_path" to relativePath,
-                        "timeout_ms" to 1500,
-                    )
-                return try {
-                    when (val response = NeovimBridge.callLua("neoai.ai_tools.lsp_diagnostic", "await_count", payload)) {
-                        is Number -> response.toInt()
-                        is String -> response.toIntOrNull() ?: 0
-                        else -> 0
-                    }
-                } catch (_: Exception) {
-                    0
                 }
-            }
-
-            private suspend fun fetchDiagnosticsReport(relativePath: String): String? {
-                val payload =
-                    mapOf(
-                        "file_path" to relativePath,
-                        "include_code_actions" to false,
-                    )
-                return try {
-                    NeovimBridge.callLua("neoai.ai_tools.lsp_diagnostic", "run", payload)
-                        ?.toString()
-                        ?.trim()
-                        ?.takeIf { it.isNotEmpty() }
-                } catch (_: Exception) {
-                    null
-                }
-            }
-        }

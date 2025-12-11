@@ -204,10 +204,18 @@ class SearchTool(
         }
     }
 
-    private fun isValidLspResult(output: String): Boolean =
-        output.isNotBlank() &&
-            !output.contains("No matches found", ignoreCase = true) &&
-            !output.contains("Error", ignoreCase = true)
+    private fun isValidLspResult(output: String): Boolean {
+        if (output.isBlank()) return false
+
+        val lower = output.lowercase()
+        if ("error" in lower) return false
+        if ("no matches found" in lower) return false
+        if ("no definitions found" in lower) return false
+        if ("no references found" in lower) return false
+        if ("no implementations found" in lower) return false
+
+        return true
+    }
 
     private fun formatOutput(content: String): String = "```txt\n$content\n```"
 
