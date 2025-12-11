@@ -283,7 +283,7 @@ class SearchTool(
             command.add(excludeFileType)
         }
 
-        command.add("--max-count=200")
+        command.add("--max-count=100")
         command.add("-e")
         command.add(query)
         command.add(".")
@@ -293,20 +293,28 @@ class SearchTool(
         val processBuilder = ProcessBuilder(command)
         processBuilder.directory(File(workingDirectory))
 
+        // Redirect stderr to stdout - simpler and avoids deadlock
+        processBuilder.redirectErrorStream(true)
+
         val process = processBuilder.start()
 
-        // Close stdin immediately. We do not write to the process, so keeping this open leaks a descriptor.
-        process.outputStream.close()
+        try {
+            process.outputStream.close()
 
-        // Read stdout. The helper function uses .use {}, so this stream is closed automatically.
-        val stdout = readStreamWithLimit(process.inputStream, 100 * 1024)
+            // Read merged stdout+stderr
+            val output = readStreamWithLimit(process.inputStream, 100 * 1024)
+            val exitCode = process.waitFor()
 
-        // Read and close stderr immediately.
-        val stderr = process.errorStream.bufferedReader().use { it.readText() }
-
-        val exitCode = process.waitFor()
-
-        return ProcessResult(stdout, stderr, exitCode)
+            // Parse stderr from merged output if exit code indicates error
+            // (for ripgrep, exitCode > 1 means actual error)
+            return ProcessResult(
+                stdout = if (exitCode <= 1) output else "",
+                stderr = if (exitCode > 1) output else "",
+                exitCode = exitCode,
+            )
+        } finally {
+            process.destroy()
+        }
     }
 
     private fun readStreamWithLimit(
@@ -321,11 +329,11 @@ class SearchTool(
 
             while (reader.read(buffer).also { bytesRead = it } != -1) {
                 if (totalRead + bytesRead > limitBytes) {
-                    output.append(buffer, 0, limitBytes - totalRead)
+                    output.appendRange(buffer, 0, limitBytes - totalRead)
                     output.append("\n... [Output truncated: too large]...")
                     break
                 }
-                output.append(buffer, 0, bytesRead)
+                output.appendRange(buffer, 0, bytesRead)
                 totalRead += bytesRead
             }
             output.toString()
