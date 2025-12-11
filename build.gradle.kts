@@ -1,8 +1,8 @@
 import org.gradle.jvm.tasks.Jar
 
 plugins {
-    kotlin("jvm") version "2.3.0-RC"
-    kotlin("plugin.serialization") version "2.0.0"
+    kotlin("jvm") version "2.3.0-RC3"
+    kotlin("plugin.serialization") version "2.3.0-RC3"
     application
     id("com.gradleup.shadow") version "9.2.2"
 }
@@ -18,11 +18,11 @@ dependencies {
     implementation(kotlin("stdlib"))
 
     // Koog agents
-    implementation("ai.koog:koog-agents:0.5.3")
-    implementation("ai.koog:agents-tools:0.5.3")
+    implementation("ai.koog:koog-agents:0.5.4")
+    implementation("ai.koog:agents-tools:0.5.4")
 
     // JSON for decoding the envelope from Lua
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
     // Msgpack for RPC communication
     implementation("org.msgpack:msgpack-core:0.9.10")
     // Msgpack for Kotlin object serialisation

@@ -82,8 +82,7 @@ import kotlin.time.Duration.Companion.minutes
 // Dispatchers.IO is best for network requests; SupervisorJob prevents one crash from killing the whole scope
 private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-// Custom GPT‑5.1 model
-private val GPT5_1 = OpenAIModels.Chat.GPT5.copy(id = "gpt-5.1")
+private val GPT5_1_CODEX = OpenAIModels.Chat.GPT5_1.copy(id = "gpt-5.1-codex")
 
 // Reuse the same client
 private val sharedHttpClient = HttpClient()
@@ -127,7 +126,7 @@ private fun injectAgentsContent(
     promptTemplate: String,
     agentsContent: String?,
 ): String {
-    if (!promptTemplate.contains(AGENTS_PLACEHOLDER)) {
+    if (AGENTS_PLACEHOLDER !in promptTemplate) {
         return promptTemplate
     }
 
@@ -137,14 +136,15 @@ private fun injectAgentsContent(
 
 private fun pickModel(name: String): ai.koog.prompt.llm.LLModel =
     when (name.lowercase()) {
+        "gpt-5.1-codex" -> {
+            GPT5_1_CODEX
+        }
+
         "gpt-5.1" -> {
-            GPT5_1
+            OpenAIModels.Chat.GPT5_1
         }
 
-        "gpt-5" -> {
-            OpenAIModels.Chat.GPT5
-        }
-
+        // TODO don't hardcode models like this
         else -> {
             ai.koog.prompt.llm.LLModel(
                 provider = ai.koog.prompt.llm.LLMProvider.OpenAI,
@@ -743,7 +743,7 @@ suspend fun generate(
                                         val callId = parts[0]
                                         val bytes = parts[1].toIntOrNull() ?: 0
                                         // Log that we are sending progress
-                                        DebugLogger.log(">> SENDING PROGRESS: $callId ($bytes bytes)")
+                                        // DebugLogger.log(">> SENDING PROGRESS: $callId ($bytes bytes)")
                                         sendToolProgress(callId, bytes, packer)
                                     } else {
                                         DebugLogger.log("⚠️ MALFORMED PROGRESS: $payload")
