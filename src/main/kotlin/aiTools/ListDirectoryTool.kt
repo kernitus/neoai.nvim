@@ -64,53 +64,60 @@ class CustomListDirectoryTool<Path>(
         processBuilder.directory(File(workingDirectory))
 
         val process = processBuilder.start()
-        val output = process.inputStream.bufferedReader().readText()
-        val exitCode = process.waitFor()
+        try {
+            val output = process.inputStream.bufferedReader().readText()
+            val exitCode = process.waitFor()
 
-        if (exitCode > 1) {
-            val error = process.errorStream.bufferedReader().readText()
-            validate(false) { "ripgrep failed: $error" }
-        }
-
-        val files = output.lines().filter { it.isNotBlank() }
-
-        if (files.isEmpty()) {
-            return Result(
-                output = "No files found in '$targetPath' (respecting .gitignore).",
-                totalFiles = 0,
-            )
-        }
-
-        // Determine effective depth based on repo size
-        val effectiveDepth =
-            when {
-                files.size <= 50 -> 999
-
-                // Show everything for small repos
-                files.size >= 400 -> minOf(args.depth, 2)
-
-                // Clamp for large repos
-                else -> args.depth
+            if (exitCode > 1) {
+                val error = process.errorStream.bufferedReader().readText()
+                validate(false) { "ripgrep failed: $error" }
             }
 
-        // Build tree from file list
-        val rootMap = buildMapFromFiles(files, targetPath)
+            val files = output.lines().filter { it.isNotBlank() }
 
-        // Render tree
-        val sb = StringBuilder()
-        sb.appendLine("🔍 Project structure for: $targetPath")
+            if (files.isEmpty()) {
+                return Result(
+                    output = "No files found in '$targetPath' (respecting .gitignore).",
+                    totalFiles = 0,
+                )
+            }
 
-        // If single file
-        if (files.size == 1 && File(files[0]).isFile) {
-            sb.appendLine("📄 ${files[0]}")
-        } else {
-            renderMap(rootMap, sb, "", 1, effectiveDepth)
+            // Determine effective depth based on repo size
+            val effectiveDepth =
+                when {
+                    files.size <= 50 -> 999
+
+                    // Show everything for small repos
+                    files.size >= 400 -> minOf(args.depth, 2)
+
+                    // Clamp for large repos
+                    else -> args.depth
+                }
+
+            // Build tree from file list
+            val rootMap = buildMapFromFiles(files, targetPath)
+
+            // Render tree
+            val sb = StringBuilder()
+            sb.appendLine("🔍 Project structure for: $targetPath")
+
+            // If single file
+            if (files.size == 1 && File(files[0]).isFile) {
+                sb.appendLine("📄 ${files[0]}")
+            } else {
+                renderMap(rootMap, sb, "", 1, effectiveDepth)
+            }
+
+            return Result(
+                output = sb.toString(),
+                totalFiles = files.size,
+            )
+        } finally {
+            runCatching { process.inputStream.close() }
+            runCatching { process.errorStream.close() }
+            runCatching { process.outputStream.close() }
+            process.destroyForcibly()
         }
-
-        return Result(
-            output = sb.toString(),
-            totalFiles = files.size,
-        )
     }
 
     private fun buildMapFromFiles(

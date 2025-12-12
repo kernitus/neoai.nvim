@@ -293,52 +293,52 @@ class SearchTool(
 
         DebugLogger.log("SearchTool: launching ${command.joinToString(" ")} in $workingDirectory")
 
-        val processBuilder = ProcessBuilder(command)
-        processBuilder.directory(File(workingDirectory))
+                val processBuilder = ProcessBuilder(command)
+                processBuilder.directory(File(workingDirectory))
 
-        // Redirect stderr to stdout - simpler and avoids deadlock
-        processBuilder.redirectErrorStream(true)
+                val process = processBuilder.start()
 
-        val process = processBuilder.start()
+                try {
+                    // No stdin needed for ripgrep
+                    process.outputStream.close()
 
-        try {
-            process.outputStream.close()
+                    val stdout = readStreamWithLimit(process.inputStream, 100 * 1024)
+                    val stderr = readStreamWithLimit(process.errorStream, 32 * 1024)
+                    val exitCode = process.waitFor()
 
-            // Read merged stdout+stderr
-            val output = readStreamWithLimit(process.inputStream, 100 * 1024)
-            val exitCode = process.waitFor()
-
-            // Parse stderr from merged output if exit code indicates error
-            // (for ripgrep, exitCode > 1 means actual error)
-            return ProcessResult(
-                stdout = if (exitCode <= 1) output else "",
-                stderr = if (exitCode > 1) output else "",
-                exitCode = exitCode,
-            )
-        } finally {
-            process.destroy()
-        }
-    }
-
-    private fun readStreamWithLimit(
-        inputStream: InputStream,
-        limitBytes: Int,
-    ): String =
-        inputStream.bufferedReader().use { reader ->
-            val buffer = CharArray(1024)
-            val output = StringBuilder()
-            var totalRead = 0
-            var bytesRead: Int
-
-            while (reader.read(buffer).also { bytesRead = it } != -1) {
-                if (totalRead + bytesRead > limitBytes) {
-                    output.appendRange(buffer, 0, limitBytes - totalRead)
-                    output.append("\n... [Output truncated: too large]...")
-                    break
+                    return ProcessResult(
+                        stdout = if (exitCode <= 1) stdout else "",
+                        stderr = if (exitCode > 1) stderr else "",
+                        exitCode = exitCode,
+                    )
+                } finally {
+                    runCatching { process.inputStream.close() }
+                    runCatching { process.errorStream.close() }
+                    runCatching { process.outputStream.close() }
+                    process.destroyForcibly()
                 }
-                output.appendRange(buffer, 0, bytesRead)
-                totalRead += bytesRead
             }
-            output.toString()
+
+            private fun readStreamWithLimit(
+                inputStream: InputStream,
+                limitBytes: Int,
+            ): String =
+                inputStream.bufferedReader().use { reader ->
+                    val buffer = CharArray(1024)
+                    val output = StringBuilder()
+                    var totalRead = 0
+                    var bytesRead: Int
+
+                    while (reader.read(buffer).also { bytesRead = it } != -1) {
+                        if (totalRead + bytesRead > limitBytes) {
+                            output.appendRange(buffer, 0, limitBytes - totalRead)
+                            output.append("\n... [Output truncated: too large]...")
+                            break
+                        }
+                        output.appendRange(buffer, 0, bytesRead)
+                        totalRead += bytesRead
+                    }
+                    output.toString()
+                }
         }
-}
+
