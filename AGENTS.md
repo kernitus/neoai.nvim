@@ -11,7 +11,7 @@ NeoAI.nvim is a Neovim plugin that provides a powerful AI-enhanced chat interfac
 
 Alongside the Lua chat interface, the project now includes a Kotlin-based companion service (see `src/main/kotlin`) that is packaged via Gradle into a shaded jar. Run `./gradlew shadowJar` whenever Kotlin sources change so the sidecar consumed by Neovim stays current.
 
-The canonical API defaults live in `lua/neoai/config.lua`: `api.main` targets `gpt-5.1-codex` with 128,000 `max_output_tokens` and reasoning effort "medium", while `api.small` targets `gpt-5-mini` with 128,000 `max_output_tokens` and reasoning effort "minimal". Keep documentation synchronised with that file whenever the presets change.
+The canonical API defaults live in `lua/neoai/config.lua`: `api.main` targets `gpt-5.1-codex-max` with 128,000 `max_output_tokens` and reasoning effort "medium", while `api.small` targets `gpt-5-mini` with 128,000 `max_output_tokens` and reasoning effort "minimal". Keep documentation synchronised with that file whenever the presets change.
 
 Behavioural notes:
 - apply_delay has been removed. The chat module and tool runner resume immediately (no artificial wait) after user sends a message or after tools complete. Any provider rate limiting should be handled upstream by the provider or via user configuration outside NeoAI.
@@ -59,7 +59,7 @@ Tool output notes:
 - Use a local path in your Neovim plugin manager (e.g., lazy.nvim) to load this repository directly during development.
 - Required dependencies: plenary.nvim, telescope.nvim, and optionally nvim-treesitter for TreeSitterQuery; ripgrep (rg) for Grep/ProjectStructure.
 - Recommended Neovim: v0.8+.
-- Configure two API profiles in setup: api.main and api.small. Defaults mirror `lua/neoai/config.lua`: `api.main` targets `gpt-5.1-codex` (128,000 `max_output_tokens`, reasoning effort "medium"), and `api.small` targets `gpt-5-mini` (128,000 `max_output_tokens`, reasoning effort "minimal"). Always defer to `lua/neoai/config.lua` as the canonical reference for presets and update documentation when those defaults change. When configuring plugin managers, pair `build = "./gradlew shadowJar"` with an `init` job (e.g., `vim.fn.jobstart({ "bash", "-c", "cd " .. plugin.dir .. " && ./gradlew shadowJar" }, { detach = true })`) so the Kotlin jar is rebuilt on install/update and during Neovim start-up.
+- Configure two API profiles in setup: api.main and api.small. Defaults mirror `lua/neoai/config.lua`: `api.main` targets `gpt-5.1-codex-max` (128,000 `max_output_tokens`, reasoning effort "medium"), and `api.small` targets `gpt-5-mini` (128,000 `max_output_tokens`, reasoning effort "minimal"). Always defer to `lua/neoai/config.lua` as the canonical reference for presets and update documentation when those defaults change. When configuring plugin managers, pair `build = "./gradlew shadowJar"` with an `init` job (e.g., `vim.fn.jobstart({ "bash", "-c", "cd " .. plugin.dir .. " && ./gradlew shadowJar" }, { detach = true })`) so the Kotlin jar is rebuilt on install/update and during Neovim start-up.
 - Logging: prefer vim.notify with appropriate severity (DEBUG/INFO/WARN/ERROR) for internal diagnostics; keep noise minimal by default.
 
 ---
