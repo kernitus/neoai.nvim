@@ -1,7 +1,32 @@
 local M = {}
 
+local log = require("neoai.debug").log
+
 local function gen_id(i)
   return string.format("bootstrap-%d-%d", os.time(), i)
+end
+
+local function filter_symbol_specs(specs)
+  local filtered = {}
+  for _, spec in ipairs(specs or {}) do
+    if type(spec) == "table" and spec.name == "SymbolIndex" then
+      table.insert(filtered, spec)
+    elseif type(spec) == "table" and spec.name then
+      log(
+        "bootstrap: skipping configured tool '%s' (bootstrap now only emits the SymbolIndex table)",
+        spec.name
+      )
+    end
+  end
+  return filtered
+end
+
+local function summarise_content(content)
+  local text = tostring(content or ""):gsub("%s+", " ")
+  if #text > 240 then
+    text = text:sub(1, 240) .. " …"
+  end
+  return text
 end
 
 -- Build schemas list from configured specs and existing tool registry
@@ -72,32 +97,33 @@ local function execute_and_persist(chat, tool_calls, spec_args_map)
       vim.notify(content, vim.log.levels.ERROR)
     end
 
-    if content == "" then
-      content = "No response"
+        if content == "" then
+          content = "No response"
+        end
+
+        log(
+          "bootstrap: tool %s executed | content_len=%d | display=%s | preview=%s",
+          call_name,
+          #content,
+          meta.display or "<none>",
+          summarise_content(content)
+        )
+
+        chat.add_message(require("neoai.chat").MESSAGE_TYPES.TOOL, content, meta, call.id)
+      end
     end
-    chat.add_message(require("neoai.chat").MESSAGE_TYPES.TOOL, content, meta, call.id)
-  end
-end
 
 -- Public: run bootstrap preflight on first turn
 function M.run_preflight(chat_module, boot_cfg)
   local ai_tools = require("neoai.ai_tools")
   local specs = nil
   if boot_cfg and type(boot_cfg.tools) == "table" and #boot_cfg.tools > 0 then
-    specs = boot_cfg.tools
-  else
-    -- Provide sensible defaults if no configuration supplied
+    specs = filter_symbol_specs(boot_cfg.tools)
+  end
+
+  if not specs or #specs == 0 then
+    -- Provide sensible defaults if no configuration supplied or nothing survived filtering
     specs = {
-      {
-        name = "ProjectStructure",
-        args = {
-          path = ".",
-          preferred_depth = 3,
-          adaptive = true,
-          small_file_threshold = 50,
-          large_file_threshold = 400,
-        },
-      },
       {
         name = "SymbolIndex",
         args = {

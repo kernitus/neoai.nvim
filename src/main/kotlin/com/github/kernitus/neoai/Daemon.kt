@@ -390,6 +390,12 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
                 if (msg.content.isBlank()) {
                     DebugLogger.log("⚠ WARNING: Tool returned EMPTY content!")
                 }
+
+                if (msg.tool?.equals("SymbolIndex", ignoreCase = true) == true) {
+                    DebugLogger.log("      ↳ SymbolIndex content BEGIN (${msg.content.length} chars)")
+                    DebugLogger.log(msg.content)
+                    DebugLogger.log("      ↳ SymbolIndex content END")
+                }
             }
 
             messages
@@ -695,8 +701,28 @@ suspend fun generate(
         val fullContent = contentParts.joinToString("\n")
         if (fullContent.isBlank()) continue
 
-        if (role == "user") {
-            messages.add(Message.User(content = fullContent, metaInfo = RequestMetaInfo.Empty))
+        when (role) {
+            "user" -> {
+                messages.add(
+                    Message.User(
+                        content = fullContent,
+                        metaInfo = RequestMetaInfo.Empty,
+                    ),
+                )
+            }
+
+            "system", "developer" -> {
+                messages.add(
+                    Message.System(
+                        content = fullContent,
+                        metaInfo = RequestMetaInfo.Empty,
+                    ),
+                )
+            }
+
+            else -> {
+                // TODO we must modify graph to take in Message.Response types too
+            }
         }
     }
 

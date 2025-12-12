@@ -117,17 +117,9 @@ config.defaults = {
     -- You may override the tool list via chat.bootstrap.tools, but it cannot be disabled.
     bootstrap = {
       strategy = "synthetic_tool_call", -- reserved for future strategies
+      -- Bootstrap now always emits only the SymbolIndex table to minimise payload size.
+      -- Custom tool lists are allowed, but any non-SymbolIndex entries will be ignored.
       tools = {
-        {
-          name = "ProjectStructure",
-          args = {
-            path = ".",
-            preferred_depth = 3,
-            adaptive = true,
-            small_file_threshold = 50,
-            large_file_threshold = 400,
-          },
-        },
         {
           name = "SymbolIndex",
           args = {
