@@ -129,20 +129,24 @@ local severity_map = {
 -- @return string: The diagnostics report, formatted as text.
 M.run = function(args)
   args = args or {}
-  -- Determine buffer number (allow internal callers to pass bufnr explicitly)
-  local bufnr ---@type integer|nil
-  if type(args.bufnr) == "number" and args.bufnr > 0 then
-    bufnr = args.bufnr
-    if not args.file_path or args.file_path == "" then
-      args.file_path = vim.api.nvim_buf_get_name(bufnr)
+
+  local bufnr = resolve_bufnr(args)
+  if not bufnr then
+    local target = args.file_path
+    if type(target) ~= "string" or target == "" then
+      target = "current buffer"
     end
+    return string.format(
+      "Unable to locate a loaded buffer for %s. Open the file in Neovim (or pass bufnr) before requesting diagnostics.",
+      target
+    )
+  end
+
+  if not vim.api.nvim_buf_is_loaded(bufnr) then
     pcall(vim.fn.bufload, bufnr)
-  elseif type(args.file_path) == "string" and #args.file_path > 0 then
-    -- Load or get existing buffer
-    bufnr = vim.fn.bufnr(args.file_path, true)
-    vim.fn.bufload(bufnr)
-  else
-    bufnr = vim.api.nvim_get_current_buf()
+  end
+
+  if not args.file_path or args.file_path == "" then
     args.file_path = vim.api.nvim_buf_get_name(bufnr)
   end
 

@@ -348,11 +348,25 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
         }
 
         val applyRequestToSession by node<List<Message.Request>, List<Message.Request>> { input ->
+            DebugLogger.log("📝 APPLYING ${input.size} MESSAGES TO SESSION")
+
+            val userMessages = input.filterIsInstance<Message.User>()
+            val toolResults = input.filterIsInstance<Message.Tool.Result>()
+
+            DebugLogger.log("   -> User messages: ${userMessages.size}")
+            DebugLogger.log("   -> Tool results: ${toolResults.size}")
+
+            if (toolResults.isNotEmpty()) {
+                toolResults.forEach { result ->
+                    DebugLogger.log("   ✅ APPENDING: ${result.tool} result (${result.content.length} chars)")
+                }
+            }
+
             llm.writeSession {
                 appendPrompt {
-                    input.filterIsInstance<Message.User>().forEach { user(it.content) }
+                    userMessages.forEach { user(it.content) }
                     tool {
-                        input.filterIsInstance<Message.Tool.Result>().forEach { result(it) }
+                        toolResults.forEach { result(it) }
                     }
                 }
                 input
@@ -360,15 +374,21 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
         }
 
         val mapToolCallsToRequests by node<List<ReceivedToolResult>, List<Message.Request>> { input ->
+            DebugLogger.log("🔄 Got ${input.size} ReceivedToolResult objects")
+
             val messages = input.map { it.toMessage() }
 
-            messages.filterIsInstance<Message.Tool.Result>().forEach { msg ->
-                DebugLogger.log("✅ TOOL FINISHED: ${msg.tool} (ID: ${msg.id})")
-                DebugLogger.log("   -> Result Length: ${msg.content.length}")
-                DebugLogger.log("   -> Preview: ${msg.content.take(100).replace("\n", " ")}...")
+            // Just log what toMessage() actually returns
+            DebugLogger.log("   Converted to ${messages.size} Message.Request objects")
+            messages.forEach { msg ->
+                DebugLogger.log("   -> Type: ${msg::class.simpleName}")
+                DebugLogger.log("      Tool: ${msg.tool}")
+                DebugLogger.log("      ID: ${msg.id}")
+                DebugLogger.log("      Content length: ${msg.content.length}")
+                DebugLogger.log("      Content preview: ${msg.content.take(100)}")
 
                 if (msg.content.isBlank()) {
-                    DebugLogger.log("⚠️ WARNING: Tool returned EMPTY content!")
+                    DebugLogger.log("⚠ WARNING: Tool returned EMPTY content!")
                 }
             }
 
