@@ -176,9 +176,23 @@ local function chat_messages_to_items(messages)
       })
     elseif role == "assistant" then
       if content ~= "" then
-        table.insert(items, {
+        local entry = {
           type = "message",
           role = "assistant",
+          content = { { type = "output_text", text = content } },
+        }
+        if m.tool_calls then
+          entry.tool_calls = m.tool_calls
+        end
+        table.insert(items, entry)
+      end
+    elseif role == "tool" then
+      if content ~= "" then
+        table.insert(items, {
+          type = "message",
+          role = "tool",
+          tool_call_id = m.tool_call_id,
+          tool_name = m.tool_name,
           content = { { type = "output_text", text = content } },
         })
       end

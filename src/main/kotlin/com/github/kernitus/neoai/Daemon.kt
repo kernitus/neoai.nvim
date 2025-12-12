@@ -82,7 +82,8 @@ import kotlin.time.Duration.Companion.minutes
 // Dispatchers.IO is best for network requests; SupervisorJob prevents one crash from killing the whole scope
 private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-private val GPT5_1_CODEX = OpenAIModels.Chat.GPT5_1.copy(id = "gpt-5.1-codex")
+private val GPT5_1_CODEX_MAX = OpenAIModels.Chat.GPT5_1.copy(id = "gpt-5.1-codex-max")
+private val GPT5_2 = OpenAIModels.Chat.GPT5_1.copy(id = "gpt-5.2")
 
 // Reuse the same client
 private val sharedHttpClient = HttpClient()
@@ -136,8 +137,12 @@ private fun injectAgentsContent(
 
 private fun pickModel(name: String): ai.koog.prompt.llm.LLModel =
     when (name.lowercase()) {
-        "gpt-5.1-codex" -> {
-            GPT5_1_CODEX
+        "gpt-5.1-codex-max" -> {
+            GPT5_1_CODEX_MAX
+        }
+
+        "gpt-5.2" -> {
+            GPT5_2
         }
 
         "gpt-5.1" -> {
@@ -391,7 +396,7 @@ private fun streamingWithToolsStrategy(customParams: LLMParams?) =
                     DebugLogger.log("⚠ WARNING: Tool returned EMPTY content!")
                 }
 
-                if (msg.tool?.equals("SymbolIndex", ignoreCase = true) == true) {
+                if (msg.tool.equals("SymbolIndex", ignoreCase = true)) {
                     DebugLogger.log("      ↳ SymbolIndex content BEGIN (${msg.content.length} chars)")
                     DebugLogger.log(msg.content)
                     DebugLogger.log("      ↳ SymbolIndex content END")
@@ -579,8 +584,12 @@ fun handleMethod(
                 if (resultVal != null && resultVal.isStringValue) {
                     resultVal.asStringValue().asString()
                 } else if (resultVal != null && resultVal.isMapValue) {
-                    // You might need a recursive converter here if the Lua tool returns complex objects
-                    resultVal.toString()
+                    // Some tool responses (e.g. SymbolIndex) are maps; serialise to JSON so content arrives in Kotlin
+                    try {
+                        Json.encodeToString(resultVal)
+                    } catch (e: Exception) {
+                        resultVal.toString()
+                    }
                 } else {
                     null
                 }
