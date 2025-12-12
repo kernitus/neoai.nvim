@@ -87,14 +87,6 @@ Use a single lazy.nvim spec that wires everything together: dependencies, Kotlin
             reasoning = { effort = "medium" },
           },
         },
-        small = {
-          api_key = os.getenv("OPENAI_API_KEY"),
-          model = "gpt-5-mini",
-          max_output_tokens = 128000,
-          additional_kwargs = {
-            reasoning = { effort = "minimal" },
-          },
-        },
       },
     })
   end,
@@ -110,8 +102,8 @@ The `build` key runs Gradle after installs/updates, whilst the `init` callback r
 
 Note on models and presets:
 
-- Both `api.main` and `api.small` must be configured (URLs, API keys, and model names).
-- The default preset in `lua/neoai/config.lua` uses `gpt-5.1-codex-max` (reasoning effort "medium") for `api.main` and `gpt-5-mini` (reasoning effort "minimal") for `api.small`, each with `max_output_tokens = 128000`. Always consult `lua/neoai/config.lua` for the definitive defaults.
+- Configure at least `api.main` (URL, API key, and model name).
+- The default preset in `lua/neoai/config.lua` uses `gpt-5.1-codex-max` (reasoning effort "medium") for `api.main` with `max_output_tokens = 128000`. Always consult `lua/neoai/config.lua` for the definitive defaults.
 
 ## Configuration
 
@@ -119,7 +111,7 @@ Call `require('neoai').setup(opts)` and only override what differs from the cano
 
 Key reminders:
 
-- Configure two labelled API profiles: `api.main` (default `gpt-5.1-codex-max`, reasoning effort "medium") and `api.small` (default `gpt-5-mini`, reasoning effort "minimal"). Both have `max_output_tokens = 128000`.
+- Configure the main API profile: `api.main` (default `gpt-5.1-codex-max`, reasoning effort "medium", `max_output_tokens = 128000`).
 - Point `build`/`init` hooks at `./gradlew shadowJar` if you are loading the plugin via lazy.nvim or another manager; this keeps the Kotlin companion jar aligned with local Kotlin sources under `src/main/kotlin`.
 - Override chat/keymap/storage settings as needed, but when documenting or scripting changes, validate them against `lua/neoai/config.lua` to avoid drift.
 
@@ -138,15 +130,6 @@ require("neoai").setup({
         reasoning = { effort = "medium" },
       },
     },
-    small = {
-      api_key = api_key,
-      model = "gpt-5-mini",
-      max_output_tokens = 128000,
-      additional_kwargs = {
-        reasoning = { effort = "minimal" },
-      },
-    },
-  },
   chat = {
     database_path = vim.fn.stdpath("data") .. "/neoai.db",
   },

@@ -13,7 +13,7 @@
 
 ---@class APISet
 ---@field main APIConfig
----@field small APIConfig
+---@field [string] APIConfig|nil
 
 ---@class KeymapConfig
 ---@field normal table<string, string>
@@ -69,7 +69,7 @@ config.defaults = {
     },
     session_picker = "default",
   },
-  -- API settings (two labelled models are required)
+  -- API settings (at least one labelled model is required; "main" is mandatory)
   api = {
     main = {
       url = "your-api-url-here", -- Use a Responses API endpoint, e.g. https://api.openai.com/v1/responses
@@ -80,16 +80,6 @@ config.defaults = {
       max_output_tokens = 4096,
       api_call_delay = 0,
       native_tools = {}, -- e.g. { { type = "web_search" } }
-    },
-    small = {
-      url = "your-api-url-here",
-      api_key = os.getenv("AI_API_KEY") or "<your api key>",
-      api_key_header = "Authorization",
-      api_key_format = "Bearer %s",
-      model = "your-small-model-here",
-      max_output_tokens = 4096,
-      api_call_delay = 0,
-      native_tools = {},
     },
   },
 
@@ -147,12 +137,6 @@ config.defaults = {
           model = "deepseek-r1-distill-llama-70b",
           max_output_tokens = 4096,
         },
-        small = {
-          url = "https://api.groq.com/openai/v1/responses",
-          api_key = os.getenv("GROQ_API_KEY") or "<your api key>",
-          model = "llama-3.1-8b-instant", -- example small
-          max_output_tokens = 4096,
-        },
       },
     },
 
@@ -170,18 +154,6 @@ config.defaults = {
             },
           },
         },
-        small = {
-          url = "https://api.openai.com/v1/responses",
-          api_key = os.getenv("OPENAI_API_KEY"),
-          model = "gpt-5-mini",
-          max_output_tokens = 128000,
-          additional_kwargs = {
-            temperature = 1,
-            reasoning = {
-              effort = "minimal",
-            },
-          },
-        },
       },
     },
 
@@ -192,12 +164,6 @@ config.defaults = {
           url = "http://localhost:11434/v1/responses",
           api_key = "", -- No API key needed for local
           model = "llama3.1:70b",
-          max_output_tokens = 4096,
-        },
-        small = {
-          url = "http://localhost:11434/v1/responses",
-          api_key = "",
-          model = "llama3.2:1b",
           max_output_tokens = 4096,
         },
       },
@@ -244,7 +210,7 @@ function config.set_defaults(opts)
   -- Apply user options (these override preset values)
   config.values = vim.tbl_deep_extend("force", merged, clean_opts)
 
-  -- Validation: require both labelled APIs
+  -- Validation: require at least the main labelled API
   local apis = config.values.api or {}
   local function missing(path)
     vim.notify("NeoAI: Missing required config: " .. path, vim.log.levels.ERROR)
@@ -258,13 +224,9 @@ function config.set_defaults(opts)
     missing("api.main")
     return
   end
-  if type(apis.small) ~= "table" then
-    missing("api.small")
-    return
-  end
 
-  -- Validate keys for both
-  for label, a in pairs({ main = apis.main, small = apis.small }) do
+  -- Validate keys for declared APIs
+  for label, a in pairs(apis) do
     if a.api_key == "<your api key>" then
       vim.notify(
         "NeoAI: Please set your API key for api." .. label .. " or use environment variables",
@@ -308,7 +270,7 @@ function config.get()
   return config.values
 end
 
---- Get API config by label ("main" or "small"). Defaults to "main".
+--- Get API config by label. Defaults to "main".
 ---@param which string|nil
 ---@return APIConfig
 function config.get_api(which)
