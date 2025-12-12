@@ -40,6 +40,7 @@ import com.github.kernitus.neoai.aiTools.CustomListDirectoryTool
 import com.github.kernitus.neoai.aiTools.CustomReadFileTool
 import com.github.kernitus.neoai.aiTools.LspDiagnosticTool
 import com.github.kernitus.neoai.aiTools.SearchTool
+import com.github.kernitus.neoai.aiTools.SymbolIndexTool
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.DefaultRequest
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
@@ -744,9 +745,10 @@ suspend fun generate(
     val listDirTool = CustomListDirectoryTool<java.nio.file.Path>(cwd)
     val searchTool = SearchTool(cwd)
     val lspDiagnosticTool = LspDiagnosticTool()
+    val symbolIndexTool = SymbolIndexTool()
     val editFileTool = CustomEditFileTool(JVMFileSystemProvider.ReadWrite, cwd)
 
-    val myTools = listOf(readFileTool, listDirTool, searchTool, lspDiagnosticTool, editFileTool)
+    val myTools = listOf(readFileTool, listDirTool, searchTool, lspDiagnosticTool, symbolIndexTool, editFileTool)
     val toolRegistry =
         ToolRegistry {
             myTools.forEach { tool(it) }

@@ -16,19 +16,15 @@ M.meta = {
       files = {
         type = "array",
         items = { type = "string" },
-        description = "Explicit list of files to scan (relative to cwd). When non-empty, overrides path/globs. Use empty array to auto-discover via globs.",
+        description =
+        "Explicit list of files to scan (relative to cwd). When non-empty, overrides path. Use empty array to auto-discover files under the path.",
         default = {},
-      },
-      globs = {
-        type = "array",
-        items = { type = "string" },
-        description = "Ripgrep -g patterns to include (e.g. ['**/*.lua','**/*.py']). Used when files array is empty.",
-        default = { "**/*" },
       },
       languages = {
         type = "array",
         items = { type = "string" },
-        description = "Only index these languages (e.g. ['lua','python']). Use empty array to include all detected languages.",
+        description =
+        "Only index these languages (e.g. ['lua','python']). Use empty array to include all detected languages.",
         default = {},
       },
       include_docstrings = {
@@ -65,7 +61,6 @@ M.meta = {
     required = {
       "path",
       "files",
-      "globs",
       "languages",
       "include_docstrings",
       "include_ranges",
@@ -230,30 +225,6 @@ local function parse_query_for_lang(lang, query)
   return nil, "No query.parse or parse_query available"
 end
 
--- Try to load a runtime query from queries/<lang>/symbol_index.scm
-local function get_runtime_query(lang)
-  local ok, ts = pcall(require, "vim.treesitter")
-  if not ok then
-    return nil
-  end
-  -- Neovim 0.10+
-  if ts.query and ts.query.get then
-    local okq, q = pcall(ts.query.get, lang, "symbol_index")
-    if okq then
-      return q
-    end
-  end
-  -- Older API
-  local okrq, ts_query = pcall(require, "vim.treesitter.query")
-  if okrq and ts_query and ts_query.get_query then
-    local okq, q = pcall(ts_query.get_query, lang, "symbol_index")
-    if okq then
-      return q
-    end
-  end
-  return nil
-end
-
 -- Language mappings and queries
 local ext2lang = {
   lua = "lua",
@@ -267,6 +238,7 @@ local ext2lang = {
   go = "go",
   rs = "rust",
   java = "java",
+  kt = "kotlin",
 }
 
 local builtin_queries = {
@@ -367,6 +339,21 @@ local builtin_queries = {
       parameters: (parameters) @params
     ) @func
   ]],
+  kotlin = [[
+    (function_declaration
+      (simple_identifier) @name
+      (function_value_parameters) @params
+    ) @func
+
+    (class_declaration
+      (type_identifier) @name
+    ) @class
+
+    (object_declaration
+      (type_identifier) @name
+    ) @class
+  ]],
+
 }
 
 local function file_extension(path)
@@ -414,7 +401,9 @@ local function leading_comment_block(bufnr, start_line_1, lang)
     end
     if lang == "lua" then
       return t:match("^%-%-+") ~= nil
-    elseif lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go" then
+    elseif
+        lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go" or lang == "kotlin"
+    then
       return t:match("^//+") ~= nil or t:match("^%* *") ~= nil
     elseif lang == "rust" then
       return t:match("^///") ~= nil or t:match("^//!") ~= nil
@@ -453,8 +442,8 @@ local function leading_comment_block(bufnr, start_line_1, lang)
       i = i - 1
     else
       if
-        (lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go")
-        and ends_with_block_end(l)
+          (lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go")
+          and ends_with_block_end(l)
       then
         in_block = true
         block_collected = { l }
@@ -481,7 +470,9 @@ local function leading_comment_block(bufnr, start_line_1, lang)
     local c = l
     if lang == "lua" then
       c = c:gsub("^%s*%-%-+%s?", "")
-    elseif lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go" then
+    elseif
+        lang == "javascript" or lang == "typescript" or lang == "tsx" or lang == "java" or lang == "go" or lang == "kotlin"
+    then
       c = c:gsub("^%s*//+%s?", "")
       c = c:gsub("^%s*/%*%*?%s?", "")
       c = c:gsub("%s*%*/%s*$", "")
@@ -546,12 +537,12 @@ local function fallback_scan(bufnr, lang, max_symbols)
   elseif lang == "python" then
     patterns = {
       { kind = "function", pat = "^%s*def%s+([A-Za-z_][%w_]*)%s*%((.-)%)" },
-      { kind = "class", pat = "^%s*class%s+([A-Za-z_][%w_]*)%s*%b()?:" },
+      { kind = "class",    pat = "^%s*class%s+([A-Za-z_][%w_]*)%s*%b()?:" },
     }
   elseif lang == "javascript" or lang == "typescript" or lang == "tsx" then
     patterns = {
       { kind = "function", pat = "^%s*function%s+([A-Za-z_$][%w_$]*)%s*%((.-)%)" },
-      { kind = "class", pat = "^%s*class%s+([A-Za-z_$][%w_$]*)%s*[%{%w]" },
+      { kind = "class",    pat = "^%s*class%s+([A-Za-z_$][%w_$]*)%s*[%{%w]" },
     }
   elseif lang == "go" then
     patterns = {
@@ -560,6 +551,12 @@ local function fallback_scan(bufnr, lang, max_symbols)
   elseif lang == "rust" then
     patterns = {
       { kind = "function", pat = "^%s*fn%s+([A-Za-z_][%w_]*)%s*%((.-)%)" },
+    }
+  elseif lang == "kotlin" then
+    patterns = {
+      { kind = "function", pat = "^%s*fun%s+([A-Za-z_][%w_]*)%s*%((.-)%)" },
+      { kind = "class", pat = "^%s*class%s+([A-Za-z_][%w_]*)%s*[%({]" },
+      { kind = "class", pat = "^%s*object%s+([A-Za-z_][%w_]*)%s*[%({]" },
     }
   end
   for i, l in ipairs(lines) do
@@ -647,34 +644,7 @@ local function extract_symbols_for_file(file_path, args)
 
   local used_any = false
   if parser then
-    -- 1) Prefer runtime symbol_index query if present
-    local tsq_sym = get_runtime_query(lang)
-    if tsq_sym then
-      local tree = parser:parse() and parser:parse()[1]
-      local root = tree and tree:root()
-      if root then
-        for _, match in (tsq_sym.iter_matches and tsq_sym:iter_matches(root, bufnr, 0, -1)) or {} do
-          local cap = {}
-          for id, node in pairs(match) do
-            local cname = tsq_sym.captures[id]
-            cap[cname] = node
-          end
-          if cap["func"] and cap["name"] then
-            push("function", cap["name"], cap["params"], cap["func"])
-          elseif cap["method"] and cap["name"] then
-            push("method", cap["name"], cap["params"], cap["method"])
-          elseif cap["class"] and cap["name"] then
-            push("class", cap["name"], nil, cap["class"])
-          end
-          if #symbols >= max_per_file then
-            break
-          end
-        end
-        used_any = used_any or #symbols > 0
-      end
-    end
-
-    -- 2) Fall back to textobjects (common across many languages if installed)
+    -- 1) Use textobjects (common across many languages if installed)
     if #symbols < max_per_file then
       local function get_query_for_group(lang2, group)
         local ok, ts = pcall(require, "vim.treesitter")
@@ -773,7 +743,7 @@ local function extract_symbols_for_file(file_path, args)
       end
     end
 
-    -- 3) Fall back to locals (definition.* captures provided by many languages)
+    -- 2) Fall back to locals (definition.* captures provided by many languages)
     if #symbols < max_per_file then
       local function get_query_for_group(lang2, group)
         local ok, ts = pcall(require, "vim.treesitter")
@@ -871,7 +841,7 @@ local function extract_symbols_for_file(file_path, args)
       end
     end
 
-    -- 4) Built-in queries as a final Tree-sitter-based fallback
+    -- 3) Built-in queries as a final Tree-sitter-based fallback
     if not used_any and builtin_queries[lang] then
       local tsq_builtin = select(1, parse_query_for_lang(lang, builtin_queries[lang]))
       if tsq_builtin then
@@ -925,7 +895,7 @@ local function gather_files(args)
     return args.files
   end
 
-  -- Otherwise use path + globs
+  -- Otherwise use path
   local path = args.path
   if type(path) ~= "string" or trim(path) == "" then
     path = "."
@@ -934,16 +904,6 @@ local function gather_files(args)
   end
 
   local cmd = { "rg", "--files", path }
-
-  -- Coerce globs: only add -g if globs array is non-empty
-  if type(args.globs) == "table" and #args.globs > 0 then
-    for _, g in ipairs(args.globs) do
-      if type(g) == "string" and g ~= "" then
-        table.insert(cmd, "-g")
-        table.insert(cmd, g)
-      end
-    end
-  end
 
   local result = vim.system(cmd, { cwd = vim.fn.getcwd(), text = true }):wait()
   if result.code > 1 then
@@ -1004,6 +964,8 @@ M.run = function(args)
     return err
   end
 
+  results = results or {} ---@type table[]
+
   if #results == 0 then
     return "SymbolIndex: No symbols found."
   end
@@ -1016,11 +978,12 @@ M.run = function(args)
     end
   end
 
+  ---@type table
   local payload = { files = results, summary = { files = fcount, symbols = scount } }
   local okj, json = pcall(vim.fn.json_encode, payload)
 
   local content
-  if okj then
+  if okj and json then
     content = utils.make_code_block(json, "json")
   else
     local lines = { "SymbolIndex results:" }
